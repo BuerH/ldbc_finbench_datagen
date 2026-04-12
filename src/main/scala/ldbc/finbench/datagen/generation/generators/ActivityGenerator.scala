@@ -98,8 +98,8 @@ class ActivityGenerator()(implicit spark: SparkSession)
       personRDD: RDD[Person],
       companyRDD: RDD[Company]
   ): RDD[Company] = {
-    val persons = spark.sparkContext.broadcast(personRDD.collect().toList)
-    val companies = spark.sparkContext.broadcast(companyRDD.collect().toList)
+    val persons = spark.sparkContext.broadcast(personRDD.collect())
+    val companies = spark.sparkContext.broadcast(companyRDD.collect())
 
     val personInvestEvent = new PersonInvestEvent()
     val companyInvestEvent = new CompanyInvestEvent()
@@ -113,7 +113,7 @@ class ActivityGenerator()(implicit spark: SparkSession)
       .mapPartitionsWithIndex { (index, targets) =>
         personInvestEvent.resetState(index)
         personInvestEvent
-          .personInvestPartition(persons.value.asJava, targets.toList.asJava)
+          .personInvestPartition(persons.value, targets.toList.asJava)
           .iterator()
           .asScala
       }
@@ -121,7 +121,7 @@ class ActivityGenerator()(implicit spark: SparkSession)
         companyInvestEvent.resetState(index)
         companyInvestEvent
           .companyInvestPartition(
-            companies.value.asJava,
+            companies.value,
             targets.toList.asJava
           )
           .iterator()
@@ -142,7 +142,6 @@ class ActivityGenerator()(implicit spark: SparkSession)
           sampleRandom.nextLong()
         )
         .collect()
-        .toList
     )
 
     val signInEvent = new SignInEvent
@@ -150,7 +149,7 @@ class ActivityGenerator()(implicit spark: SparkSession)
       signInEvent
         .signIn(
           mediums.toList.asJava,
-          accountSampleList.value.asJava,
+          accountSampleList.value,
           index
         )
         .iterator()
@@ -161,14 +160,14 @@ class ActivityGenerator()(implicit spark: SparkSession)
   def accountActivitiesEvent(accountRDD: RDD[Account]): RDD[Account] = {
     val accountActivitiesEvent = new AccountActivitiesEvent
     val cards = spark.sparkContext.broadcast(
-      accountRDD.filter(_.getType == "debit card").collect().toList
+      accountRDD.filter(_.getType == "debit card").collect()
     )
 
     accountRDD.mapPartitionsWithIndex((index, accounts) => {
       accountActivitiesEvent
         .accountActivities(
-          accounts.toList.asJava,
-          cards.value.asJava,
+          accounts.toArray,
+          cards.value,
           index
         )
         .iterator()
@@ -188,7 +187,6 @@ class ActivityGenerator()(implicit spark: SparkSession)
           sampleRandom.nextLong()
         )
         .collect()
-        .toList
     )
 
     loanRDD.mapPartitionsWithIndex((index, loans) => {
@@ -196,7 +194,7 @@ class ActivityGenerator()(implicit spark: SparkSession)
       loanSubEvents
         .afterLoanApplied(
           loans.toList.asJava,
-          sampledAccounts.value.asJava,
+          sampledAccounts.value,
           index
         )
         .iterator()

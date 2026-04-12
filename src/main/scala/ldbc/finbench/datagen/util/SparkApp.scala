@@ -72,14 +72,12 @@ trait SparkApp {
     // register kryo classes for edges
     sparkConf.registerKryoClasses(
       Array(
-        classOf[CompanyApplyLoan],
+        classOf[ApplyLoan],
         classOf[CompanyGuaranteeCompany],
         classOf[CompanyInvestCompany],
-        classOf[CompanyOwnAccount],
-        classOf[PersonApplyLoan],
+        classOf[OwnAccount],
         classOf[PersonGuaranteePerson],
         classOf[PersonInvestCompany],
-        classOf[PersonOwnAccount],
         classOf[Repay],
         classOf[SignIn],
         classOf[Transfer],

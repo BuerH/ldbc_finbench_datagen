@@ -24,9 +24,7 @@ import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
-import ldbc.finbench.datagen.entities.edges.CompanyOwnAccount;
 import ldbc.finbench.datagen.entities.edges.Deposit;
-import ldbc.finbench.datagen.entities.edges.PersonOwnAccount;
 import ldbc.finbench.datagen.entities.edges.Repay;
 import ldbc.finbench.datagen.entities.edges.Transfer;
 import ldbc.finbench.datagen.entities.nodes.Account;
@@ -41,9 +39,11 @@ public class LoanActivitiesEvents implements Serializable {
     private final Random actionRandom;
     private final Random amountRandom;
     private final List<Consumer<Loan>> consumers;
+    private Account[] targetAccounts;
+    private int targetAccountsSize;
+
     // Note: Don't make it static. It will be accessed by different Spark workers, which makes multiplicity wrong.
     private final Map<String, AtomicLong> multiplicityMap;
-    private List<Account> targetAccounts;
 
     public LoanActivitiesEvents() {
         multiplicityMap = new ConcurrentHashMap<>();
@@ -64,9 +64,10 @@ public class LoanActivitiesEvents implements Serializable {
         amountRandom.setSeed(seed);
     }
 
-    public List<Loan> afterLoanApplied(List<Loan> loans, List<Account> targets, int blockId) {
+    public List<Loan> afterLoanApplied(List<Loan> loans, Account[] targets, int blockId) {
         resetState(blockId);
         targetAccounts = targets;
+        targetAccountsSize = targetAccounts.length;
         for (Loan loan : loans) {
             int count = 0;
             while (count++ < DatagenParams.numLoanActions) {
@@ -102,7 +103,7 @@ public class LoanActivitiesEvents implements Serializable {
 
     private void transferSubEvent(Loan loan) {
         Account account = getAccount(loan);
-        Account target = targetAccounts.get(indexRandom.nextInt(targetAccounts.size()));
+        Account target = targetAccounts[indexRandom.nextInt(targetAccountsSize)];
         if (actionRandom.nextDouble() < 0.5) {
             if (!cannotTransfer(account, target)) {
                 Transfer.createLoanTransfer(randomFarm, account, target, loan,
@@ -133,12 +134,7 @@ public class LoanActivitiesEvents implements Serializable {
     }
 
     private Account getAccount(Loan loan) {
-        if (loan.getOwnerType() == PersonOrCompany.PERSON) {
-            List<PersonOwnAccount> poa = loan.getOwnerPerson().getPersonOwnAccounts();
-            return poa.get(indexRandom.nextInt(poa.size())).getAccount();
-        } else {
-            List<CompanyOwnAccount> coa = loan.getOwnerCompany().getCompanyOwnAccounts();
-            return coa.get(indexRandom.nextInt(coa.size())).getAccount();
-        }
+        Account[] accounts = loan.getAccounts();
+        return accounts[indexRandom.nextInt(accounts.length)];
     }
 }

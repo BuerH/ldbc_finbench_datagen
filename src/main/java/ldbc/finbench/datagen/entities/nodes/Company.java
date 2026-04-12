@@ -17,14 +17,15 @@
 package ldbc.finbench.datagen.entities.nodes;
 
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
-import ldbc.finbench.datagen.entities.edges.CompanyApplyLoan;
+import ldbc.finbench.datagen.entities.edges.ApplyLoan;
 import ldbc.finbench.datagen.entities.edges.CompanyGuaranteeCompany;
 import ldbc.finbench.datagen.entities.edges.CompanyInvestCompany;
-import ldbc.finbench.datagen.entities.edges.CompanyOwnAccount;
+import ldbc.finbench.datagen.entities.edges.OwnAccount;
 import ldbc.finbench.datagen.entities.edges.PersonInvestCompany;
 import ldbc.finbench.datagen.generation.dictionary.Dictionaries;
 
@@ -38,22 +39,26 @@ public class Company implements Serializable {
     private String business;
     private String description;
     private String url;
-    private final List<CompanyOwnAccount> companyOwnAccounts;
+    private final List<OwnAccount> ownAccounts;
     // invested by persons
     private final List<PersonInvestCompany> personInvestCompanies;
     // invested by companies
     private final List<CompanyInvestCompany> companyInvestCompanies;
     private final LinkedHashSet<CompanyGuaranteeCompany> guaranteeSrc;
     private final LinkedHashSet<CompanyGuaranteeCompany> guaranteeDst;
-    private final List<CompanyApplyLoan> companyApplyLoans;
+    private final List<ApplyLoan> applyLoans;
+    private final List<Account> accounts;
+    private final List<Loan> loans;
 
     public Company() {
-        companyOwnAccounts = new LinkedList<>();
+        ownAccounts = new LinkedList<>();
         personInvestCompanies = new LinkedList<>();
         companyInvestCompanies = new LinkedList<>();
         guaranteeSrc = new LinkedHashSet<>();
         guaranteeDst = new LinkedHashSet<>();
-        companyApplyLoans = new LinkedList<>();
+        applyLoans = new LinkedList<>();
+        accounts = new ArrayList<>();
+        loans = new LinkedList<>();
     }
 
     @Override
@@ -91,8 +96,16 @@ public class Company implements Serializable {
         this.companyName = companyName;
     }
 
-    public List<CompanyOwnAccount> getCompanyOwnAccounts() {
-        return companyOwnAccounts;
+    public List<OwnAccount> getOwnAccounts() {
+        return ownAccounts;
+    }
+
+    public List<Account> getAccount() {
+        return accounts;
+    }
+
+    public void addAccount(Account account) {
+        this.accounts.add(account);
     }
 
     public List<PersonInvestCompany> getPersonInvestCompanies() {
@@ -146,8 +159,16 @@ public class Company implements Serializable {
         return guaranteeDst;
     }
 
-    public List<CompanyApplyLoan> getCompanyApplyLoans() {
-        return companyApplyLoans;
+    public List<ApplyLoan> getApplyLoans() {
+        return applyLoans;
+    }
+
+    public List<Loan> getLoan() {
+        return loans;
+    }
+
+    public void addLoan(Loan loan) {
+        this.loans.add(loan);
     }
 
     public long getCreationDate() {

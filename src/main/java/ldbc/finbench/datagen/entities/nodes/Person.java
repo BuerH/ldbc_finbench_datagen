@@ -17,14 +17,15 @@
 package ldbc.finbench.datagen.entities.nodes;
 
 import java.io.Serializable;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.LinkedList;
 import java.util.List;
-import ldbc.finbench.datagen.entities.edges.PersonApplyLoan;
+import ldbc.finbench.datagen.entities.edges.ApplyLoan;
+import ldbc.finbench.datagen.entities.edges.OwnAccount;
 import ldbc.finbench.datagen.entities.edges.PersonGuaranteePerson;
 import ldbc.finbench.datagen.entities.edges.PersonInvestCompany;
-import ldbc.finbench.datagen.entities.edges.PersonOwnAccount;
 import ldbc.finbench.datagen.generation.dictionary.Dictionaries;
 
 public class Person implements Serializable {
@@ -36,18 +37,22 @@ public class Person implements Serializable {
     private long birthday;
     private int countryId;
     private int cityId;
-    private final List<PersonOwnAccount> personOwnAccounts;
+    private final List<OwnAccount> ownAccounts;
     private final List<PersonInvestCompany> personInvestCompanies;
     private final LinkedHashSet<PersonGuaranteePerson> guaranteeSrc;
     private final LinkedHashSet<PersonGuaranteePerson> guaranteeDst;
-    private final List<PersonApplyLoan> personApplyLoans;
+    private final List<ApplyLoan> applyLoans;
+    private final List<Account> accounts;
+    private final List<Loan> loans;
 
     public Person() {
-        personOwnAccounts = new LinkedList<>();
+        ownAccounts = new LinkedList<>();
         personInvestCompanies = new LinkedList<>();
         guaranteeSrc = new LinkedHashSet<>();
         guaranteeDst = new LinkedHashSet<>();
-        personApplyLoans = new LinkedList<>();
+        applyLoans = new LinkedList<>();
+        accounts = new ArrayList<>();
+        loans = new LinkedList<>();
     }
 
     @Override
@@ -85,8 +90,17 @@ public class Person implements Serializable {
         this.personName = personName;
     }
 
-    public List<PersonOwnAccount> getPersonOwnAccounts() {
-        return personOwnAccounts;
+    public List<OwnAccount> getOwnAccounts() {
+        return ownAccounts;
+    }
+
+
+    public List<Account> getAccount() {
+        return accounts;
+    }
+
+    public void addAccount(Account account) {
+        this.accounts.add(account);
     }
 
     public List<PersonInvestCompany> getPersonInvestCompanies() {
@@ -101,8 +115,16 @@ public class Person implements Serializable {
         return guaranteeDst;
     }
 
-    public List<PersonApplyLoan> getPersonApplyLoans() {
-        return personApplyLoans;
+    public List<ApplyLoan> getApplyLoans() {
+        return applyLoans;
+    }
+
+    public List<Loan> getLoan() {
+        return loans;
+    }
+    
+    public void addLoan(Loan loan) {
+        this.loans.add(loan);
     }
 
     public long getCreationDate() {

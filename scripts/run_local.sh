@@ -47,4 +47,3 @@ time spark-submit --master local[*] \
 #    ${LDBC_FINBENCH_DATAGEN_JAR} \
 #    --scale-factor 100 \
 #    --output-dir ${OUTPUT_DIR}
-

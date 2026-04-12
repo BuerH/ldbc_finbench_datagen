@@ -19,9 +19,9 @@ package ldbc.finbench.datagen.generation.events;
 import java.io.Serializable;
 import java.util.List;
 import java.util.Random;
-import ldbc.finbench.datagen.entities.edges.PersonApplyLoan;
+import ldbc.finbench.datagen.entities.edges.ApplyLoan;
+import ldbc.finbench.datagen.entities.edges.OwnAccount;
 import ldbc.finbench.datagen.entities.edges.PersonGuaranteePerson;
-import ldbc.finbench.datagen.entities.edges.PersonOwnAccount;
 import ldbc.finbench.datagen.entities.nodes.Account;
 import ldbc.finbench.datagen.entities.nodes.Loan;
 import ldbc.finbench.datagen.entities.nodes.Person;
@@ -65,7 +65,7 @@ public class PersonActivitiesEvent implements Serializable {
             int numAccounts = numAccRand.nextInt(DatagenParams.maxAccountsPerOwner);
             for (int i = 0; i < Math.max(1, numAccounts); i++) {
                 Account to = accountGenerator.generateAccount(from.getCreationDate(), "person", blockId);
-                PersonOwnAccount.createPersonOwnAccount(randomFarm, from, to, to.getCreationDate());
+                OwnAccount.createOwnAccount(randomFarm, from, to, to.getCreationDate());
             }
             // guarantee other persons
             if (pickPersonGuaRand.nextDouble() < DatagenParams.personGuaranteeFraction) {
@@ -83,7 +83,7 @@ public class PersonActivitiesEvent implements Serializable {
                 for (int i = 0; i < Math.max(1, numLoans); i++) {
                     long applyDate = Dictionaries.dates.randomPersonToLoanDate(dateRand, from);
                     Loan to = loanGenerator.generateLoan(applyDate, "person", blockId);
-                    PersonApplyLoan.createPersonApplyLoan(randomFarm, applyDate, from, to);
+                    ApplyLoan.createApplyLoan(randomFarm, applyDate, from, to);
                 }
             }
         }

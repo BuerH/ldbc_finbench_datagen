@@ -19,9 +19,9 @@ package ldbc.finbench.datagen.generation.events;
 import java.io.Serializable;
 import java.util.List;
 import java.util.Random;
-import ldbc.finbench.datagen.entities.edges.CompanyApplyLoan;
+import ldbc.finbench.datagen.entities.edges.ApplyLoan;
 import ldbc.finbench.datagen.entities.edges.CompanyGuaranteeCompany;
-import ldbc.finbench.datagen.entities.edges.CompanyOwnAccount;
+import ldbc.finbench.datagen.entities.edges.OwnAccount;
 import ldbc.finbench.datagen.entities.nodes.Account;
 import ldbc.finbench.datagen.entities.nodes.Company;
 import ldbc.finbench.datagen.entities.nodes.Loan;
@@ -64,7 +64,7 @@ public class CompanyActivitiesEvent implements Serializable {
             int numAccounts = numAccRand.nextInt(DatagenParams.maxAccountsPerOwner);
             for (int i = 0; i < Math.max(1, numAccounts); i++) {
                 Account account = accountGenerator.generateAccount(from.getCreationDate(), "company", blockId);
-                CompanyOwnAccount.createCompanyOwnAccount(randomFarm, from, account, account.getCreationDate());
+                OwnAccount.createOwnAccount(randomFarm, from, account, account.getCreationDate());
             }
             // guarantee other companies
             if (pickCompanyGuaRand.nextDouble() < DatagenParams.companyGuaranteeFraction) {
@@ -82,7 +82,7 @@ public class CompanyActivitiesEvent implements Serializable {
                 for (int i = 0; i < Math.max(1, numLoans); i++) {
                     long applyDate = Dictionaries.dates.randomCompanyToLoanDate(dateRand, from);
                     Loan to = loanGenerator.generateLoan(applyDate, "company", blockId);
-                    CompanyApplyLoan.createCompanyApplyLoan(randomFarm, applyDate, from, to);
+                    ApplyLoan.createApplyLoan(randomFarm, applyDate, from, to);
                 }
             }
         }

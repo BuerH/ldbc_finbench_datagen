@@ -63,13 +63,15 @@ public class AccountActivitiesEvent implements Serializable {
     // Generation to parts will mess up the average degree(make it bigger than expected) caused by ceiling operations.
     // Also, it will mess up the long tail range of powerlaw distribution of degrees caused by 1 rounded to 2.
     // See the plot drawn by check_transfer.py for more details.
-    public List<Account> accountActivities(List<Account> accounts, List<Account> cards, int blockId) {
+    public List<Account> accountActivities(Account[] accounts, Account[] cards, int blockId) {
         resetState(blockId);
         Random pickAccountForWithdrawal = randomFarm.get(RandomGeneratorFarm.Aspect.ACCOUNT_WHETHER_WITHDRAW);
 
-        LinkedList<Integer> availableToAccountIds = getIndexList(accounts.size());
-        maxSkippedCount = Math.min(maxSkippedCount, (int) (skippedRatio * accounts.size()));
+        int accountSize = accounts.length;
+        LinkedList<Integer> availableToAccountIds = getIndexList(accountSize);
+        maxSkippedCount = Math.min(maxSkippedCount, (int) (skippedRatio * accountSize));
 
+        int cardsize = cards.length;
         // Simplified version of transfer process
         //        for (int i = 0; i < accounts.size(); i++) {
         //            Account from = accounts.get(i);
@@ -92,14 +94,14 @@ public class AccountActivitiesEvent implements Serializable {
         //                }
         //            }
         //        }
-        for (int fromIndex = 0; fromIndex < accounts.size(); fromIndex++) {
-            Account from = accounts.get(fromIndex);
+        for (int fromIndex = 0; fromIndex < accountSize; fromIndex++) {
+            Account from = accounts[fromIndex];
             // TRANSFER: account transfer to other accounts
             while (from.getAvailableOutDegree() != 0) {
                 int skippedCount = 0;
                 for (int j = 0; j < availableToAccountIds.size(); j++) {
                     int toIndex = availableToAccountIds.get(j);
-                    Account to = accounts.get(toIndex);
+                    Account to = accounts[toIndex];
                     if (toIndex == fromIndex || cannotTransfer(from, to)) {
                         skippedCount++;
                         continue;
@@ -109,6 +111,7 @@ public class AccountActivitiesEvent implements Serializable {
                     for (int mindex = 0; mindex < numTransfers; mindex++) {
                         Transfer.createTransfer(randomFarm, from, to, mindex);
                     }
+
                     if (to.getAvailableInDegree() == 0) {
                         availableToAccountIds.remove(j);
                         j--;
@@ -122,19 +125,18 @@ public class AccountActivitiesEvent implements Serializable {
                     break;
                 }
             }
+
             // WITHDRAW: account withdraw to cards
             if (pickAccountForWithdrawal.nextDouble() < DatagenParams.accountWithdrawFraction) {
                 for (int count = 0; count < DatagenParams.maxWithdrawals; count++) {
-                    Account to = cards.get(randIndex.nextInt(cards.size()));
+                    Account to = cards[randIndex.nextInt(cardsize)];
                     if (!cannotWithdraw(from, to)) {
                         Withdraw.createWithdraw(randomFarm, from, to, getMultiplicityIdAndInc(from, to));
                     }
-
                 }
             }
-
         }
-        return accounts;
+        return java.util.Arrays.asList(accounts);
     }
 
     // Transfer to self is not allowed
