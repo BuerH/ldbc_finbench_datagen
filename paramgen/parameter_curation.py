@@ -13,14 +13,15 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 import codecs
 import multiprocessing
+import multiprocessing.connection
 import os
 import random
 import sys
+from array import array
 from ast import literal_eval
 from calendar import timegm
 from collections import defaultdict
-from datetime import date, datetime
-from functools import partial
+from datetime import date
 from glob import glob
 import concurrent.futures
 
@@ -43,6 +44,19 @@ THRESH_HOLD_6    = 0
 TIME_TRUNCATE    = True
 TRUNCATION_ORDER = "TIMESTAMP_DESCENDING" if TIME_TRUNCATE else "AMOUNT_DESCENDING"
 BATCH_SIZE       = 5000
+
+# Sizing knobs — edit them here, there are no CLI/env options.
+#
+# MAX_CONCURRENT_TASKS: query-generator tasks running at once. The run's
+# memory peak is roughly the SUM of the co-resident tasks, so 1 is the
+# safe value for SF3000 on a 400GiB box (the solo peak is q3-bound,
+# ~270GiB projected); raise to 2-5 for smaller scales (SF30 ran 2 slots
+# at 4.5GiB PSS).
+MAX_CONCURRENT_TASKS = 1
+# INNER_WORKERS: fork children per task for the scans and iter pipelines.
+# Payloads are fork-COW-shared, so extra workers cost only their private
+# scan state; 3 is the memory/speed knee.
+INNER_WORKERS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -81,35 +95,39 @@ def read_csv(file_path):
     return pd.concat([pd.read_csv(f, delimiter='|') for f in all_files], ignore_index=True)
 
 
+def _parse_literal_column(col_series):
+    return col_series.apply(literal_eval)
+
+
+def _apply_literal_eval(df, list_col):
+    # ast.literal_eval dominates load time on the item tables; parse
+    # contiguous chunks in parallel (row order and parsed values unchanged).
+    parallelism = INNER_WORKERS
+    if parallelism <= 1 or len(df) < _PARALLEL_MIN_ITEMS:
+        df[list_col] = df[list_col].apply(literal_eval)
+        return df
+    step = -(-len(df) // parallelism)
+    chunks = [df[list_col].iloc[i:i + step]
+              for i in range(0, len(df), step)]
+    with concurrent.futures.ProcessPoolExecutor(max_workers=parallelism) as ex:
+        futures = [ex.submit(_parse_literal_column, c) for c in chunks]
+        parsed = [f.result() for f in futures]
+    df[list_col] = pd.concat(parsed)
+    return df
+
+
 def load_indexed_list_df(file_path):
     df = read_csv(file_path)
     key_col, val_col = df.columns[0], df.columns[1]
-    df[val_col] = df[val_col].apply(literal_eval)
+    _apply_literal_eval(df, val_col)
     df.set_index(key_col, inplace=True)
     return df
 
 
 def load_person_account_df(file_path):
     df = read_csv(file_path)
-    list_col = df.columns[1]
-    df[list_col] = df[list_col].apply(literal_eval)
+    _apply_literal_eval(df, df.columns[1])
     return df
-
-
-def load_loan_month_account_map(file_path):
-    df = read_csv(file_path)
-    if len(df.columns) < 3:
-        return {}
-
-    loan_col, month_col, account_col = df.columns[0], df.columns[1], df.columns[2]
-    df[account_col] = df[account_col].apply(literal_eval)
-
-    result = defaultdict(dict)
-    for loan_id, month_start, account_list in df[[loan_col, month_col, account_col]].itertuples(index=False, name=None):
-        accounts = [int(a) for a in account_list]
-        if accounts:
-            result[int(loan_id)][int(month_start)] = accounts
-    return dict(result)
 
 
 # ---------------------------------------------------------------------------
@@ -123,10 +141,34 @@ def neighbor_time(item):
     return int(item[2]) if isinstance(item, (list, tuple)) and len(item) >= 3 else None
 
 def month_start_ms(timestamp_ms):
-    dt = datetime.utcfromtimestamp(int(timestamp_ms) / 1000)
-    return timegm(date(dt.year, dt.month, 1).timetuple()) * 1000
+    # UTC start of the month containing timestamp_ms, in integer day
+    # arithmetic (Hinnant civil-from-days). Equivalent to
+    # timegm(date(utcfromtimestamp(ts).timetuple())) * 1000: both depend
+    # only on days = ts // 86_400_000 and return that month's first day.
+    days = int(timestamp_ms) // 86_400_000
+    z = days + 719_468
+    doe = z - (z // 146_097) * 146_097
+    yoe = (doe - doe // 1460 + doe // 36_524 - doe // 146_096) // 365
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    return (days - doy + (153 * mp + 2) // 5) * 86_400_000
+
+
+def _month_start_ms_vec(ts_arr):
+    """month_start_ms over an int64 ndarray (identical values; never feed it
+    the _TS_NONE sentinel — filter first)."""
+    days = ts_arr // 86_400_000
+    z = days + 719_468
+    doe = z - (z // 146_097) * 146_097
+    yoe = (doe - doe // 1460 + doe // 36_524 - doe // 146_096) // 365
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    return (days - doy + (153 * mp + 2) // 5) * 86_400_000
 
 def get_neighbors(indexed_df, key):
+    # accepts an indexed DataFrame or a plain {id: items} dict built from one
+    if isinstance(indexed_df, dict):
+        return indexed_df.get(key) or []
     try:
         row = indexed_df.loc[key]
     except KeyError:
@@ -144,6 +186,433 @@ def get_neighbors(indexed_df, key):
     if isinstance(values, pd.Series):
         return values.tolist()
     return []
+
+
+_TS_NONE = np.iinfo(np.int64).min  # sentinel for a null timestamp in CSR arrays
+
+
+class CsrAdjacency(dict):
+    """CSR-backed adjacency: flat arrays instead of boxed per-edge lists.
+
+    src-sorted dst/ts int64, amount float64, node index — ~28B/edge resident
+    vs ~130B/edge of Python objects, which is what keeps RAM-bound SF1000+
+    runs feasible. A dict subclass so get_neighbors' dict branch (and the
+    q3/q8 kernels' adj.get) serve from it untouched; .get() rebuilds one
+    node's items on demand (~2x scan time vs pre-boxed lists, the price of
+    the flat footprint).
+    """
+
+    __slots__ = ('node_ids', 'indptr', 'dst', 'amount', 'ts',
+                 'pairs', 'per_node_limit')
+
+    def __init__(self, node_ids, indptr, dst, amount, ts,
+                 pairs=False, per_node_limit=None):
+        super().__init__()
+        self.node_ids = node_ids
+        self.indptr = indptr
+        self.dst = dst
+        self.amount = amount
+        self.ts = ts
+        self.pairs = pairs
+        self.per_node_limit = per_node_limit
+
+    def get(self, key, default=None):
+        node_ids = self.node_ids
+        pos = int(np.searchsorted(node_ids, key))
+        if pos >= node_ids.shape[0] or node_ids[pos] != key:
+            return default
+        s = int(self.indptr[pos])
+        e = int(self.indptr[pos + 1])
+        if s == e:
+            return default
+        # q3/q8 window kernels never read past the first per_node_limit
+        # edges, so a truncated slice is output-identical and slimmer
+        if self.per_node_limit is not None and e - s > self.per_node_limit:
+            e = s + self.per_node_limit
+        ts = self.ts[s:e]
+        if self.pairs:
+            return [(int(d), None if t == _TS_NONE else int(t))
+                    for d, t in zip(self.dst[s:e], ts)]
+        return [[int(d), float(a), None if t == _TS_NONE else int(t)]
+                for d, a, t in zip(self.dst[s:e], self.amount[s:e], ts)]
+
+
+def graph_adjacency(table):
+    """Adjacency of a GraphTable, for graph-scan payloads."""
+    return table.adjacency
+
+
+def table_adjacency(table, pairs=False, per_node_limit=None):
+    """CSR adjacency view of a GraphTable, sharing its arrays."""
+    base = table.adjacency
+    if not pairs and per_node_limit is None:
+        return base
+    return CsrAdjacency(base.node_ids, base.indptr, base.dst, base.amount,
+                        base.ts, pairs=pairs, per_node_limit=per_node_limit)
+
+
+# ---------------------------------------------------------------------------
+# Direct CSV -> CSR loader: skips the parsed-DataFrame floor
+# ---------------------------------------------------------------------------
+
+_CSR_SHARD_BYTES = 8 << 20
+
+
+def _parse_csr_shard(text):
+    """Parse `key|[[dst, amount, ts], ...]` shard text into flat arrays.
+
+    Emits exactly the edges a parsed-table walk would produce: table
+    order, 3-slot items only, a None ts as the _TS_NONE sentinel. Malformed
+    rows raise RuntimeError — never ValueError — so the query wrappers'
+    except clauses cannot silently swallow a bad parse into a fallback.
+    """
+    row_keys = array('q')
+    keys = array('q')
+    dst = array('q')
+    amt = array('d')
+    ts = array('q')
+    for line in text.split('\n'):
+        if not line or line.endswith('|items'):
+            continue
+        pipe = line.find('|')
+        if pipe < 0:
+            raise RuntimeError(f'malformed factor row: {line[:80]!r}')
+        body = line[pipe + 1:]
+        if not body.startswith('['):
+            raise RuntimeError(f'unexpected items cell: {body[:80]!r}')
+        key = int(line[:pipe])
+        row_keys.append(key)
+        toks = body[1:-1].replace('[', '').replace(']', '').split(',')
+        if not toks or toks == ['']:
+            continue
+        if len(toks) % 3:
+            raise RuntimeError(f'non-triplet items cell: {line[pipe:pipe + 80]!r}')
+        for i in range(0, len(toks), 3):
+            keys.append(key)
+            dst.append(int(toks[i]))
+            amt.append(float(toks[i + 1]))
+            t = toks[i + 2]
+            ts.append(_TS_NONE if t == 'None' else int(t))
+    return row_keys, keys, dst, amt, ts
+
+
+def _first_occurrence_order(rows):
+    """Keys in row order with duplicates dropped (pandas Index.unique order)."""
+    n = rows.shape[0]
+    if n == 0:
+        return rows
+    order = np.argsort(rows, kind='stable')
+    sorted_rows = rows[order]
+    mask = np.empty(n, dtype=bool)
+    mask[0] = True
+    np.not_equal(sorted_rows[1:], sorted_rows[:-1], out=mask[1:])
+    # order[mask] are first-occurrence positions in arbitrary order; sorting
+    # them restores row (appearance) order
+    return rows[np.sort(order[mask])]
+
+
+class GraphTable:
+    """CSR-mode stand-in for an indexed items DataFrame: adjacency arrays
+    parsed straight from CSV plus the row-order node list. Supports the two
+    access patterns the candidate builders use — graph_adjacency() /
+    table_adjacency() and .index.unique() — with the same edges and per-node
+    order as the DataFrame path, minus the ~300B/edge parsed floor."""
+    __slots__ = ('adjacency', '_nodes')
+
+    def __init__(self, adjacency, nodes):
+        self.adjacency = adjacency
+        self._nodes = nodes
+
+    @property
+    def index(self):
+        return _IndexView(self._nodes)
+
+
+class _IndexView:
+    __slots__ = ('nodes',)
+
+    def __init__(self, nodes):
+        self.nodes = nodes
+
+    def unique(self):
+        return self.nodes
+
+
+def _iter_text_shards(paths):
+    """Yield line-aligned text shards from the sorted part files, in order.
+
+    Each part file's first line (the `xxx|items` header) is consumed by its
+    first shard; a shard never crosses a file boundary tail unless the file
+    ends without a newline.
+    """
+    for path in paths:
+        with open(path, 'rb') as f:
+            first = True
+            buf = b''
+            while True:
+                chunk = f.read(_CSR_SHARD_BYTES)
+                if not chunk:
+                    break
+                buf += chunk
+                nl = buf.rfind(b'\n')
+                if nl < 0:
+                    continue
+                text = buf[:nl].decode('utf-8')
+                buf = buf[nl + 1:]
+                if first:
+                    text = text.partition('\n')[2]
+                    first = False
+                if text:
+                    yield text
+            if buf.strip():
+                text = buf.decode('utf-8')
+                if first:
+                    text = text.partition('\n')[2]
+                if text:
+                    yield text
+
+
+def load_indexed_graph(file_path):
+    """GraphTable parsed directly from the pipe-CSV factor tables.
+
+    The parent streams the part files into line-aligned text shards and keeps
+    only a bounded window in flight while worker processes tokenize (the
+    expensive part); shard results then concatenate in file order into
+    src-sorted CSR arrays, without the parsed-DataFrame floor. Building the
+    sorted views briefly holds ~2x the edge arrays; transients, then freed.
+    """
+    if os.path.isfile(file_path):
+        paths = [file_path]
+    else:
+        paths = sorted(glob(os.path.join(file_path, '*.csv')))
+        if not paths:
+            raise FileNotFoundError(
+                f"Factor table path does not exist or has no CSVs: {file_path}. "
+                "Please regenerate factor_table outputs before running paramgen."
+            )
+    parallelism = INNER_WORKERS
+    parts = []
+    if parallelism <= 1:
+        parts = [_parse_csr_shard(t) for t in _iter_text_shards(paths)]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=parallelism) as ex:
+            in_flight = []
+            for text in _iter_text_shards(paths):
+                in_flight.append(ex.submit(_parse_csr_shard, text))
+                while len(in_flight) >= 4 * parallelism:
+                    parts.append(in_flight.pop(0).result())
+            while in_flight:
+                parts.append(in_flight.pop(0).result())
+    row_keys = array('q')
+    keys = array('q')
+    dst = array('q')
+    amt = array('d')
+    ts = array('q')
+    for rk, k, d, a, t in parts:
+        row_keys.extend(rk)
+        keys.extend(k)
+        dst.extend(d)
+        amt.extend(a)
+        ts.extend(t)
+    del parts
+    src = np.frombuffer(keys, dtype=np.int64)
+    n = src.shape[0]
+    if n == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return GraphTable(CsrAdjacency(empty, np.zeros(1, dtype=np.int64),
+                                       empty, np.empty(0), empty), empty)
+    order = np.argsort(src, kind='stable')
+    src_sorted = src[order]
+    # src_sorted is sorted by construction, so group starts give node_ids and
+    # indptr directly (same values np.unique(src[order]) would return)
+    starts = np.empty(n, dtype=bool)
+    starts[0] = True
+    np.not_equal(src_sorted[1:], src_sorted[:-1], out=starts[1:])
+    node_ids = src_sorted[starts]
+    indptr = np.append(np.flatnonzero(starts), n)
+    del src_sorted, starts, src, keys
+    dst_sorted = np.frombuffer(dst, dtype=np.int64)[order]
+    amt_sorted = np.frombuffer(amt, dtype=np.float64)[order]
+    ts_sorted = np.frombuffer(ts, dtype=np.int64)[order]
+    del order, dst, amt, ts
+    adjacency = CsrAdjacency(node_ids, indptr, dst_sorted, amt_sorted, ts_sorted)
+    nodes = _first_occurrence_order(np.frombuffer(row_keys, dtype=np.int64))
+    return GraphTable(adjacency, nodes)
+
+
+# ---------------------------------------------------------------------------
+# Loan (id, month) -> accounts map, array form
+# ---------------------------------------------------------------------------
+
+class LoanAccountMap:
+    """Array form of loan_month_account_map: {loan: {month: [accounts]}}.
+
+    Reproduces the dict loader's semantics exactly: rows with empty account
+    lists are skipped, loans appear in first-occurrence order, months within
+    a loan in first-occurrence order, and a duplicated (loan, month) carries
+    the LAST row's accounts (dict assignment overwrites values, not keys).
+    loan_ids stays in appearance order (iteration order); lookups go through
+    the sorted_ids/sorted_pos index built once here.
+    """
+    __slots__ = ('loan_ids', 'loan_ptr', 'row_month', 'acc_ptr', 'acc_flat',
+                 'sorted_ids', 'sorted_pos')
+
+    def __init__(self, loan_ids, loan_ptr, row_month, acc_ptr, acc_flat):
+        self.loan_ids = loan_ids
+        self.loan_ptr = loan_ptr
+        self.row_month = row_month
+        self.acc_ptr = acc_ptr
+        self.acc_flat = acc_flat
+        self.sorted_pos = np.argsort(loan_ids, kind='stable')
+        self.sorted_ids = loan_ids[self.sorted_pos]
+
+    def loan_rows(self, loan_id):
+        """(start, end) row range for a loan, or (-1, -1) if absent."""
+        pos = int(np.searchsorted(self.sorted_ids, loan_id))
+        if pos >= self.sorted_ids.shape[0] or self.sorted_ids[pos] != loan_id:
+            return -1, -1
+        row = int(self.sorted_pos[pos])
+        return int(self.loan_ptr[row]), int(self.loan_ptr[row + 1])
+
+
+def _parse_loan_shard(text):
+    """Parse `loan_id|month_start|[accounts...]` shard text into flat arrays."""
+    loans = array('q')
+    months = array('q')
+    counts = array('q')
+    accs = array('q')
+    for line in text.split('\n'):
+        if not line:
+            continue
+        p1 = line.find('|')
+        p2 = line.find('|', p1 + 1) if p1 >= 0 else -1
+        if p2 < 0:
+            raise RuntimeError(f'malformed loan row: {line[:80]!r}')
+        body = line[p2 + 1:]
+        if not body.startswith('['):
+            raise RuntimeError(f'unexpected account cell: {body[:80]!r}')
+        flat = body[1:-1].replace('[', '').replace(']', '')
+        toks = flat.split(',') if flat else []
+        loans.append(int(line[:p1]))
+        months.append(int(line[p1 + 1:p2]))
+        counts.append(len(toks))
+        for t in toks:
+            accs.append(int(t))
+    return loans, months, counts, accs
+
+
+def load_loan_month_accounts_array(file_path):
+    """LoanAccountMap parsed directly from the 3-column pipe CSVs."""
+    if os.path.isfile(file_path):
+        paths = [file_path]
+    else:
+        paths = sorted(glob(os.path.join(file_path, '*.csv')))
+        if not paths:
+            raise FileNotFoundError(
+                f"Factor table path does not exist or has no CSVs: {file_path}. "
+                "Please regenerate factor_table outputs before running paramgen."
+            )
+    parallelism = INNER_WORKERS
+    parts = []
+    if parallelism <= 1:
+        parts = [_parse_loan_shard(t) for t in _iter_text_shards(paths)]
+    else:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=parallelism) as ex:
+            in_flight = []
+            for text in _iter_text_shards(paths):
+                in_flight.append(ex.submit(_parse_loan_shard, text))
+                while len(in_flight) >= 4 * parallelism:
+                    parts.append(in_flight.pop(0).result())
+            while in_flight:
+                parts.append(in_flight.pop(0).result())
+    loans_a = array('q')
+    months_a = array('q')
+    counts_a = array('q')
+    accs_a = array('q')
+    for lo, mo, c, ac in parts:
+        loans_a.extend(lo)
+        months_a.extend(mo)
+        counts_a.extend(c)
+        accs_a.extend(ac)
+    del parts
+    L = np.frombuffer(loans_a, dtype=np.int64)
+    M = np.frombuffer(months_a, dtype=np.int64)
+    C = np.frombuffer(counts_a, dtype=np.int64)
+    A = np.frombuffer(accs_a, dtype=np.int64)
+    row_ptr = np.append(0, np.cumsum(C))
+    # skip empty-account rows (the dict loader's `if accounts:` guard)
+    keep = C > 0
+    row_lo = row_ptr[:-1][keep]
+    row_hi = row_ptr[1:][keep]
+    L, M = L[keep], M[keep]
+    n = L.shape[0]
+    empty = np.empty(0, dtype=np.int64)
+    if n == 0:
+        return LoanAccountMap(empty, np.zeros(1, dtype=np.int64),
+                              empty, np.zeros(1, dtype=np.int64), empty)
+    # group duplicated (loan, month) rows: lexsort is stable, so ties keep
+    # row order — group head gives first occurrence (ordering), group tail
+    # the last row's accounts (payload)
+    idx = np.arange(n)
+    order = np.lexsort((idx, M, L))
+    gL, gM = L[order], M[order]
+    gstart = np.empty(n, dtype=bool)
+    gstart[0] = True
+    np.logical_or(gL[1:] != gL[:-1], gM[1:] != gM[:-1], out=gstart[1:])
+    grp_first = order[gstart]
+    grp_last = order[np.append(np.flatnonzero(gstart)[1:], n) - 1]
+    grp_loan, grp_month = gL[gstart], gM[gstart]
+    # loans in first-occurrence order; within a loan, months by first occurrence
+    appear = _first_occurrence_order(L)
+    ord2 = np.argsort(appear, kind='stable')
+    # appear[ord2[k]] is the k-th smallest loan; its appearance rank is ord2[k]
+    grp_rank = ord2[np.searchsorted(appear[ord2], grp_loan)]
+    final = np.lexsort((grp_first, grp_rank))
+    fl, fm = grp_loan[final], grp_month[final]
+    lstart = np.empty(n, dtype=bool)
+    lstart[0] = True
+    lstart[1:] = fl[1:] != fl[:-1]
+    loan_ids = fl[lstart]
+    loan_ptr = np.append(np.flatnonzero(lstart), n)
+    last_lo = row_lo[grp_last[final]]
+    last_hi = row_hi[grp_last[final]]
+    lens = last_hi - last_lo
+    acc_ptr = np.append(0, np.cumsum(lens))
+    total = int(lens.sum())
+    if total:
+        grp_idx = np.repeat(np.arange(n), lens)
+        within = np.arange(total) - np.repeat(acc_ptr[:-1], lens)
+        acc_flat = A[last_lo[grp_idx] + within]
+    else:
+        acc_flat = empty
+    return LoanAccountMap(loan_ids, loan_ptr, fm, acc_ptr, acc_flat)
+
+
+def to_month_counts_map(month_df):
+    """{id: {month_ms: count}} dict view of an indexed month-count table.
+
+    _has_month_activity accepts either form; the dict replaces a pandas
+    .loc plus Series indexing per visited node. First row wins on
+    duplicate index keys (matching _get_month_count's .iloc[0]); columns
+    that are not integer month timestamps are unreachable through either
+    lookup key form and are dropped.
+    """
+    col_months = {}
+    for c in month_df.columns:
+        try:
+            col_months[c] = int(str(c))
+        except (TypeError, ValueError):
+            continue
+    if not col_months:
+        return {}
+    if not month_df.index.is_unique:
+        month_df = month_df[~month_df.index.duplicated(keep='first')]
+    cols = [c for c in month_df.columns if c in col_months]
+    months = [col_months[c] for c in cols]
+    out = {}
+    for idx, row in zip(month_df.index, month_df[cols].to_numpy()):
+        out[int(idx)] = dict(zip(months, row))
+    return out
 
 
 def truncate_neighbors(neighbors, limit=TRUNCATION_LIMIT):
@@ -170,8 +639,15 @@ def collect_path_stats(indexed_df, current_id, prev_ts, visited, depth,
     neighbors = truncate_neighbors(get_neighbors(indexed_df, current_id),
                                    truncation_limit)
     for item in neighbors:
-        dst = neighbor_id(item)
-        ts  = neighbor_time(item)
+        if item.__class__ is list and len(item) >= 3:
+            # fast path: parsed factor rows are [dst, amount, ts] lists
+            dst = int(item[0])
+            ts = item[2]
+            if ts is not None:
+                ts = int(ts)
+        else:
+            dst = neighbor_id(item)
+            ts = neighbor_time(item)
         if ts is None or dst in visited or ts <= prev_ts:
             continue
         if target_month is not None and month_start_ms(ts) != target_month:
@@ -232,8 +708,15 @@ def collect_month_matches_decreasing(indexed_df, current_id, prev_ts, visited, d
     neighbors = truncate_neighbors(get_neighbors(indexed_df, current_id),
                                    truncation_limit)
     for item in neighbors:
-        src = neighbor_id(item)
-        ts  = neighbor_time(item)
+        if item.__class__ is list and len(item) >= 3:
+            # fast path: parsed factor rows are [dst, amount, ts] lists
+            src = int(item[0])
+            ts = item[2]
+            if ts is not None:
+                ts = int(ts)
+        else:
+            src = neighbor_id(item)
+            ts = neighbor_time(item)
         if ts is None or src in visited or ts >= prev_ts:
             continue
         traversed += 1
@@ -255,9 +738,15 @@ def collect_month_matches_decreasing(indexed_df, current_id, prev_ts, visited, d
     return traversed
 
 
-def _has_month_activity(month_df, item_id, month_start):
+_EMPTY_MONTH_COUNTS = {}
+
+
+def _has_month_activity(month_counts, item_id, month_start):
+    # accepts an indexed DataFrame or a {id: {month_ms: count}} dict view
+    if isinstance(month_counts, dict):
+        return month_counts.get(item_id, _EMPTY_MONTH_COUNTS).get(month_start, 0) > 0
     try:
-        row = month_df.loc[item_id]
+        row = month_counts.loc[item_id]
     except KeyError:
         return False
     return _get_month_count(row, month_start) > 0
@@ -348,12 +837,101 @@ def _format_time(tp):
 
 
 # ---------------------------------------------------------------------------
+# Parallel scan (ordered chunk map over per-item search loops)
+# ---------------------------------------------------------------------------
+
+_PARALLEL_MIN_ITEMS = 256
+
+
+def _parallel_scan(scan_fn, items, *shared):
+    """Map scan_fn(item_chunk, *shared) over items in parallel.
+
+    Chunks preserve input order and results are collected in submission
+    order, so the flattened output matches a serial scan exactly.
+    """
+    items = list(items)
+    if not items:
+        return []
+    parallelism = INNER_WORKERS
+    if parallelism <= 1 or len(items) < _PARALLEL_MIN_ITEMS:
+        return scan_fn(items, *shared)
+    step = -(-len(items) // parallelism)
+    chunks = [items[i:i + step] for i in range(0, len(items), step)]
+    return [row for rows in _fork_map(scan_fn, chunks, shared) for row in rows]
+
+
+_FORK_JOB = None  # (fn, chunks, shared) inherited by fork children
+
+
+def _fork_send(rank, conn):
+    fn, chunks, shared = _FORK_JOB
+    try:
+        conn.send(('OK', fn(chunks[rank], *shared)))
+    except BaseException as e:
+        try:
+            conn.send(('ERR', e))
+        except BaseException:
+            pass  # parent closed the pipe first (another chunk failed)
+    finally:
+        conn.close()
+
+
+def _fork_map(fn, chunks, shared):
+    """Map fn(chunk, *shared) over chunks in fork children.
+
+    The payload reaches workers as fork-inherited copy-on-write pages
+    instead of pickled per-worker copies: numpy data pages are never
+    written (refcounts live in the ndarray header page), so big adjacency
+    arrays stay physically shared across all W workers. Results return
+    through pipes in chunk order, matching a serial scan. Children are
+    forked single-threaded (any executor pools are closed by then), and a
+    child that dies without answering (e.g. an OOM kill) surfaces as an
+    EOFError on its pipe — RuntimeError, which the query wrappers'
+    except clauses deliberately do not swallow.
+    """
+    global _FORK_JOB
+    if len(chunks) == 1:
+        return [fn(chunks[0], *shared)]
+    _FORK_JOB = (fn, chunks, shared)
+    ctx = multiprocessing.get_context('fork')
+    procs, conns = [], []
+    results, err = [], None
+    try:
+        for rank in range(len(chunks)):
+            recv, send = ctx.Pipe(duplex=False)
+            p = ctx.Process(target=_fork_send, args=(rank, send))
+            p.start()
+            send.close()  # children hold their own end; the parent only reads
+            procs.append(p)
+            conns.append(recv)
+        for conn in conns:
+            try:
+                tag, val = conn.recv()
+            except EOFError:
+                err = err or RuntimeError('fork scan worker died')
+                break
+            if tag == 'ERR':
+                err = val
+                break
+            results.append(val)
+    finally:
+        for conn in conns:
+            conn.close()  # unblocks any child still writing, then they exit
+        for p in procs:
+            p.join()
+        _FORK_JOB = None
+    if err is not None:
+        raise err
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Per-query candidate builders  (pure logic, no I/O)
 # ---------------------------------------------------------------------------
 
-def _candidates_query1(transfer_out_df, blocked_signin_month_df):
-    candidate_rows = []
-    for src_id in transfer_out_df.index.unique():
+def _q1_scan_srcs(src_ids, transfer_out_df, blocked_signin_month_df):
+    rows = []
+    for src_id in src_ids:
         src_id = int(src_id)
         match_ids = defaultdict(set)
         match_ranges = {}
@@ -366,8 +944,15 @@ def _candidates_query1(transfer_out_df, blocked_signin_month_df):
         )
         for month, ids in match_ids.items():
             mn, mx = match_ranges.get(month, (month, month))
-            candidate_rows.append([(src_id, int(month), int(mn), int(mx)),
-                                   traversed_counts[month], hit_counts[month], len(ids)])
+            rows.append([(src_id, int(month), int(mn), int(mx)),
+                         traversed_counts[month], hit_counts[month], len(ids)])
+    return rows
+
+
+def _candidates_query1(transfer_out_df, blocked_signin_month_df):
+    candidate_rows = _parallel_scan(
+        _q1_scan_srcs, list(transfer_out_df.index.unique()),
+        graph_adjacency(transfer_out_df), to_month_counts_map(blocked_signin_month_df))
     if not candidate_rows:
         return [], []
     first_array = np.array(candidate_rows, dtype=object)
@@ -389,8 +974,15 @@ def _collect_q1_with_range(indexed_df, current_id, prev_ts, visited, depth,
     neighbors = truncate_neighbors(get_neighbors(indexed_df, current_id),
                                    truncation_limit)
     for item in neighbors:
-        dst = neighbor_id(item)
-        ts  = neighbor_time(item)
+        if item.__class__ is list and len(item) >= 3:
+            # fast path: parsed factor rows are [dst, amount, ts] lists
+            dst = int(item[0])
+            ts = item[2]
+            if ts is not None:
+                ts = int(ts)
+        else:
+            dst = neighbor_id(item)
+            ts = neighbor_time(item)
         if ts is None or dst in visited or ts <= prev_ts:
             continue
         month = month_start_ms(ts)
@@ -416,12 +1008,12 @@ def _collect_q1_with_range(indexed_df, current_id, prev_ts, visited, depth,
                                  )
 
 
-def _candidates_query2(person_account_df, transfer_in_df, loan_deposit_month_df):
-    person_col, account_col = person_account_df.columns[0], person_account_df.columns[1]
-    stats = {}
-    for _, row in person_account_df.iterrows():
-        person_id = int(row[person_col])
-        for account_id in row[account_col]:
+def _q2_scan_persons(person_entries, transfer_in_df, loan_deposit_month_df):
+    rows = []
+    for person_id, account_ids in person_entries:
+        person_id = int(person_id)
+        stats = {}
+        for account_id in account_ids:
             account_id = int(account_id)
             match_ids, hit_counts = defaultdict(set), defaultdict(int)
             match_months = defaultdict(set)
@@ -441,14 +1033,23 @@ def _candidates_query2(person_account_df, transfer_in_df, loan_deposit_month_df)
                 stats[key]['account_hits'].add(account_id)
                 stats[key]['traversed']    += traversed
                 stats[key]['months'].update(match_months.get(month, {month}))
-    if not stats:
+        for (pid, month), s in stats.items():
+            months = s['months'] or {month}
+            rows.append([(pid, min(months), max(months)),
+                         s['traversed'], len(s['other_ids']),
+                         s['hit_count'], len(s['account_hits'])])
+    return rows
+
+
+def _candidates_query2(person_account_df, transfer_in_df, loan_deposit_month_df):
+    person_col, account_col = person_account_df.columns[0], person_account_df.columns[1]
+    person_entries = [(row[person_col], row[account_col])
+                      for _, row in person_account_df.iterrows()]
+    candidate_rows = _parallel_scan(
+        _q2_scan_persons, person_entries, graph_adjacency(transfer_in_df),
+        loan_deposit_month_df)
+    if not candidate_rows:
         return [], []
-    candidate_rows = []
-    for (pid, month), s in stats.items():
-        months = s['months'] or {month}
-        candidate_rows.append([(pid, min(months), max(months)),
-                               s['traversed'], len(s['other_ids']),
-                               s['hit_count'], len(s['account_hits'])])
     first_array = np.array(candidate_rows, dtype=object)
     selected = select_candidates(first_array, 0.01)
     ids = [int(s[0]) for s in selected]
@@ -457,19 +1058,11 @@ def _candidates_query2(person_account_df, transfer_in_df, loan_deposit_month_df)
     return ids, time_list
 
 
-def _candidates_query3(transfer_out_df, pool_ids, pool_times,
-                       friendly_accounts, scan_cap=10_000):
-    transfer_col = transfer_out_df.columns[0]
-    adjacency = {
-        int(src): [(neighbor_id(item), neighbor_time(item)) for item in items
-                   if isinstance(item, (list, tuple)) and len(item) >= 3]
-        for src, items in transfer_out_df[transfer_col].items()
-    }
-    time_by_id = {int(account_id): tp
-                  for account_id, tp in zip(pool_ids, pool_times)}
+def _q3_scan_srcs(src_ids, adjacency, time_by_id, friendly_accounts, scan_cap):
     candidate_rows = []
 
-    for src_id in map(int, pool_ids):
+    for src_id in src_ids:
+        src_id = int(src_id)
         tp = time_by_id[src_id]
         frontier = [src_id]
         visited = {src_id}
@@ -506,6 +1099,18 @@ def _candidates_query3(transfer_out_df, pool_ids, pool_times,
         dst_id, cost = candidates[0]
         candidate_rows.append([(src_id, dst_id), cost])
 
+    return candidate_rows
+
+
+def _candidates_query3(transfer_out_df, pool_ids, pool_times,
+                       friendly_accounts, scan_cap=10_000):
+    adjacency = table_adjacency(transfer_out_df, pairs=True)
+    time_by_id = {int(account_id): tp
+                  for account_id, tp in zip(pool_ids, pool_times)}
+    candidate_rows = _parallel_scan(
+        _q3_scan_srcs, list(pool_ids), adjacency, time_by_id,
+        friendly_accounts, scan_cap)
+
     if len(candidate_rows) < 4:
         selected = [row[0] for row in candidate_rows]
     else:
@@ -517,50 +1122,140 @@ def _candidates_query3(transfer_out_df, pool_ids, pool_times,
     return ids, id2_list, time_list
 
 
-def _candidates_query4(transfer_out_df, transfer_in_df):
-    out_by_src      = defaultdict(set)
-    in_by_dst       = defaultdict(set)
-    pair_count      = defaultdict(int)
-    pair_months     = defaultdict(list)
+# q4: the parent-side pair_count/pair_months/out_by_src/in_by_dst dicts
+# (~350B/pair and up) become flat arrays — the pair table as unique (src, dst)
+# pairs under a stable lexsort, counts as group sizes, months as a CSR over
+# pairs; set membership rebuilds from table-order edge slices so set iteration
+# order (which orders candidate rows) matches the original dict build exactly.
 
-    for src_id in transfer_out_df.index.unique():
-        src_id = int(src_id)
-        for item in get_neighbors(transfer_out_df, src_id):
-            dst = neighbor_id(item); ts = neighbor_time(item)
-            if ts is None or dst == src_id: continue
-            out_by_src[src_id].add(dst)
-            pair_count[(src_id, dst)] += 1
-            pair_months[(src_id, dst)].append(month_start_ms(ts))
+def _q4_pair_index(usrc, udst, src, dst):
+    """Position of (src, dst) in the lexsorted pair arrays, -1 if absent."""
+    lo = int(np.searchsorted(usrc, src, 'left'))
+    hi = int(np.searchsorted(usrc, src, 'right'))
+    if lo == hi:
+        return -1
+    p = lo + int(np.searchsorted(udst[lo:hi], dst))
+    return p if p < hi and udst[p] == dst else -1
 
-    for dst_id in transfer_in_df.index.unique():
-        dst_id = int(dst_id)
-        for item in get_neighbors(transfer_in_df, dst_id):
-            src = neighbor_id(item); ts = neighbor_time(item)
-            if ts is None or src == dst_id: continue
-            in_by_dst[dst_id].add(src)
 
-    candidate_rows = []
-    for src_id, direct_dsts in out_by_src.items():
-        incoming = in_by_dst.get(src_id, set())
+def _q4_scan_srcs(src_dst_items, payload):
+    (F_node, F_ptr, F_dst, IN_node, IN_ptr, IN_src,
+     usrc, udst, pptr, mts) = payload
+    rows = []
+    for src_id, direct_dsts in src_dst_items:
+        ipos = int(np.searchsorted(IN_node, src_id))
+        if ipos >= IN_node.shape[0] or IN_node[ipos] != src_id:
+            continue
+        s = int(IN_ptr[ipos]); e = int(IN_ptr[ipos + 1])
+        incoming = set(IN_src[s:e].tolist())
         if not incoming: continue
         for dst_id in direct_dsts:
-            outgoing_from_dst = out_by_src.get(dst_id, set())
-            cycles = outgoing_from_dst & incoming - {src_id, dst_id}
+            opos = int(np.searchsorted(F_node, dst_id))
+            if opos >= F_node.shape[0] or F_node[opos] != dst_id:
+                continue
+            s = int(F_ptr[opos]); e = int(F_ptr[opos + 1])
+            outgoing = set(F_dst[s:e].tolist())
+            cycles = outgoing & incoming - {src_id, dst_id}
             if not cycles: continue
-            e1 = pair_count.get((src_id, dst_id), 0)
-            e2 = sum(pair_count.get((o, src_id), 0) for o in cycles)
-            e3 = sum(pair_count.get((dst_id, o), 0) for o in cycles)
-
-            all_months = list(pair_months.get((src_id, dst_id), []))
+            e1 = e2 = e3 = 0
+            all_months = []
+            pi = _q4_pair_index(usrc, udst, src_id, dst_id)
+            if pi >= 0:
+                m0, m1 = int(pptr[pi]), int(pptr[pi + 1])
+                e1 = m1 - m0
+                all_months = mts[m0:m1].tolist()
             for o in cycles:
-                all_months.extend(pair_months.get((o, src_id), []))
-                all_months.extend(pair_months.get((dst_id, o), []))
+                pi = _q4_pair_index(usrc, udst, o, src_id)
+                if pi >= 0:
+                    m0, m1 = int(pptr[pi]), int(pptr[pi + 1])
+                    e2 += m1 - m0
+                    all_months.extend(mts[m0:m1].tolist())
+                pi = _q4_pair_index(usrc, udst, dst_id, o)
+                if pi >= 0:
+                    m0, m1 = int(pptr[pi]), int(pptr[pi + 1])
+                    e3 += m1 - m0
+                    all_months.extend(mts[m0:m1].tolist())
             if not all_months:
                 continue
-            min_month = min(all_months)
-            max_month = max(all_months)
-            candidate_rows.append([(src_id, dst_id, min_month, max_month),
-                                   len(cycles), e1+e2+e3, e1])
+            rows.append([(src_id, dst_id, min(all_months), max(all_months)),
+                         len(cycles), e1 + e2 + e3, e1])
+    return rows
+
+
+def _q4_filtered_csr(adj):
+    """Table-order CSR over an adjacency's valid edges (ts set, not self-loop).
+
+    The q4 parent walk skipped those edges before touching any dict, so both
+    the membership sets and the pair table build from the filtered stream.
+    Returns (node_ids, indptr, dst_sorted, src_stream, dst_stream, ts_stream).
+    """
+    src = np.repeat(adj.node_ids, np.diff(adj.indptr))
+    keep = (adj.ts != _TS_NONE) & (adj.dst != src)
+    fsrc, fdst, fts = src[keep], adj.dst[keep], adj.ts[keep]
+    del src, keep
+    n = fsrc.shape[0]
+    empty = np.empty(0, dtype=np.int64)
+    if n == 0:
+        return empty, np.zeros(1, dtype=np.int64), empty, empty, empty, empty
+    order = np.argsort(fsrc, kind='stable')
+    ssorted = fsrc[order]
+    starts = np.empty(n, dtype=bool)
+    starts[0] = True
+    np.not_equal(ssorted[1:], ssorted[:-1], out=starts[1:])
+    node = ssorted[starts]
+    ptr = np.append(np.flatnonzero(starts), n)
+    return node, ptr, fdst[order], fsrc, fdst, fts
+
+
+def _candidates_query4(transfer_out_df, transfer_in_df):
+    out_adj = graph_adjacency(transfer_out_df)
+    in_adj  = graph_adjacency(transfer_in_df)
+
+    F_node, F_ptr, F_dst, fsrc, fdst, fts = _q4_filtered_csr(out_adj)
+    IN_node, IN_ptr, IN_src, _, _, _ = _q4_filtered_csr(in_adj)
+
+    n = fsrc.shape[0]
+    empty = np.empty(0, dtype=np.int64)
+    if n == 0:
+        usrc = udst = mts = empty
+        pptr = np.zeros(1, dtype=np.int64)
+    else:
+        # pair table: stable lexsort keeps a pair's parallel edges in table
+        # order, so the per-pair month list matches the dict append order
+        lex = np.lexsort((fdst, fsrc))
+        lsrc, ldst = fsrc[lex], fdst[lex]
+        pstarts = np.empty(n, dtype=bool)
+        pstarts[0] = True
+        np.logical_or(lsrc[1:] != lsrc[:-1], ldst[1:] != ldst[:-1],
+                      out=pstarts[1:])
+        usrc, udst = lsrc[pstarts], ldst[pstarts]
+        pptr = np.append(np.flatnonzero(pstarts), n)
+        mts = _month_start_ms_vec(fts[lex])
+        del lex, lsrc, ldst, pstarts
+
+    # src_dst_items mirrors the dict build's (insertion order, set iteration
+    # order). The dict walked index.unique() order and inserted a src's key
+    # during its single visit iff it had a valid edge — so the order is the
+    # table-appearance node order filtered to nodes present in the filtered
+    # CSR (NOT the sorted order of the CSR stream). dsts are list(set(slice)):
+    # the slice is that src's valid edges in table order, the same insertion
+    # sequence out_by_src saw, so the set layout (and list() of it) matches.
+    nodes = np.asarray(transfer_out_df._nodes)
+    if F_node.shape[0]:
+        vpos = np.searchsorted(F_node, nodes)
+        vhit = vpos < F_node.shape[0]
+        src_first = nodes[vhit & (F_node[np.minimum(vpos, F_node.shape[0] - 1)] == nodes)]
+    else:
+        src_first = nodes[:0]
+    pos = np.searchsorted(F_node, src_first)
+    src_dst_items = []
+    for i, src in enumerate(src_first):
+        s = int(pos[i])
+        lo, hi = int(F_ptr[s]), int(F_ptr[s + 1])
+        src_dst_items.append((int(src), list(set(F_dst[lo:hi].tolist()))))
+    payload = (F_node, F_ptr, F_dst, IN_node, IN_ptr, IN_src,
+               usrc, udst, pptr, mts)
+    candidate_rows = _parallel_scan(_q4_scan_srcs, src_dst_items, payload)
 
     if not candidate_rows:
         return [], [], []
@@ -574,15 +1269,23 @@ def _candidates_query4(transfer_out_df, transfer_in_df):
     return src_ids, dst_ids, time_list
 
 
-def _candidates_query5(person_account_df, transfer_out_df):
-    person_col, account_col = person_account_df.columns[0], person_account_df.columns[1]
-    stats = {}
-    for _, row in person_account_df.iterrows():
-        person_id = int(row[person_col])
-        for account_id in row[account_col]:
+def _q5_scan_persons(person_entries, transfer_out_df):
+    rows = []
+    for person_id, account_ids in person_entries:
+        person_id = int(person_id)
+        stats = {}
+        for account_id in account_ids:
             account_id = int(account_id)
             for item in get_neighbors(transfer_out_df, account_id):
-                dst = neighbor_id(item); ts = neighbor_time(item)
+                if item.__class__ is list and len(item) >= 3:
+                    # fast path: parsed factor rows are [dst, amount, ts] lists
+                    dst = int(item[0])
+                    ts = item[2]
+                    if ts is not None:
+                        ts = int(ts)
+                else:
+                    dst = neighbor_id(item)
+                    ts = neighbor_time(item)
                 if ts is None or dst == account_id: continue
                 month = month_start_ms(ts)
                 key = (person_id, month)
@@ -600,14 +1303,22 @@ def _candidates_query5(person_account_df, transfer_out_df):
                 stats[key]['dst_ids'].update(sub_r)
                 stats[key]['path_count'] += sub_c
                 stats[key]['months'].update(sub_months)
-    if not stats:
+        for (pid, month), s in stats.items():
+            months = s['months'] or {month}
+            rows.append([(pid, min(months), max(months)),
+                         s['path_count'], len(s['dst_ids']),
+                         len(s['account_hits'])])
+    return rows
+
+
+def _candidates_query5(person_account_df, transfer_out_df):
+    person_col, account_col = person_account_df.columns[0], person_account_df.columns[1]
+    person_entries = [(row[person_col], row[account_col])
+                      for _, row in person_account_df.iterrows()]
+    candidate_rows = _parallel_scan(
+        _q5_scan_persons, person_entries, graph_adjacency(transfer_out_df))
+    if not candidate_rows:
         return [], []
-    candidate_rows = []
-    for (pid, month), s in stats.items():
-        months = s['months'] or {month}
-        candidate_rows.append([(pid, min(months), max(months)),
-                               s['path_count'], len(s['dst_ids']),
-                               len(s['account_hits'])])
     first_array = np.array(candidate_rows, dtype=object)
     selected = select_candidates(first_array, 0.01)
     ids = [int(s[0]) for s in selected]
@@ -616,31 +1327,18 @@ def _candidates_query5(person_account_df, transfer_out_df):
     return ids, time_list
 
 
-def _candidates_query6(withdraw_in_df, transfer_in_month_df):
-    card_account_ids = _load_card_account_ids()
-    if not card_account_ids:
-        return [], []
-    candidate_rows = []
-
-    mid_total_transfers = {}
-    for mid_id in transfer_in_month_df.index:
-        row = transfer_in_month_df.loc[mid_id]
-        if isinstance(row, pd.DataFrame):
-            row = row.iloc[0]
-        total = sum(float(v) for v in row.values if isinstance(v, (int, float, np.integer, np.floating)))
-        mid_total_transfers[int(mid_id)] = total
-
-    for card_id in card_account_ids:
+def _q6_scan_cards(card_ids, withdraw_in_df, mid_total_transfers):
+    rows = []
+    for card_id in card_ids:
+        card_id = int(card_id)
         month_stats = defaultdict(lambda: dict(mid_ids=set(), transfer_count=0,
                                                withdraw_count=0, withdraw_amount=0.0,
                                                months=set()))
         for item in get_neighbors(withdraw_in_df, card_id):
             mid = neighbor_id(item); ts = neighbor_time(item)
             if ts is None: continue
-            try:
-                month_row = transfer_in_month_df.loc[mid]
-            except KeyError:
-                continue
+            # mid_total_transfers covers every transfer_in_month index row;
+            # a missing mid scores 0 and is filtered by the threshold below
             if mid_total_transfers.get(mid, 0) <= 3:
                 continue
             month = month_start_ms(ts)
@@ -654,9 +1352,25 @@ def _candidates_query6(withdraw_in_df, transfer_in_month_df):
         for month, s in month_stats.items():
             if s['mid_ids']:
                 months = s['months'] or {month}
-                candidate_rows.append([(card_id, min(months), max(months)),
-                                       len(s['mid_ids']), s['transfer_count'],
-                                       s['withdraw_count'], s['withdraw_amount']])
+                rows.append([(card_id, min(months), max(months)),
+                             len(s['mid_ids']), s['transfer_count'],
+                             s['withdraw_count'], s['withdraw_amount']])
+    return rows
+
+
+def _candidates_query6(withdraw_in_df, transfer_in_month_df):
+    card_account_ids = _load_card_account_ids()
+    if not card_account_ids:
+        return [], []
+
+    # row totals via a vectorized sum; the table is int64 with a unique
+    # index, so values match the per-row .loc loop exactly
+    mid_total_transfers = {int(mid_id): total
+                           for mid_id, total in transfer_in_month_df.sum(axis=1).items()}
+
+    candidate_rows = _parallel_scan(
+        _q6_scan_cards, list(card_account_ids), graph_adjacency(withdraw_in_df),
+        mid_total_transfers)
     if not candidate_rows:
         return [], []
     first_array = np.array(candidate_rows, dtype=object)
@@ -691,42 +1405,92 @@ def _bfs_window_cost(adj, seeds, start_ms, end_ms, max_depth=3,
     return inwin
 
 
-def _candidates_query8(loan_month_account_map, trans_withdraw_df):
-    adj = defaultdict(list)
-    items_col = trans_withdraw_df.columns[0]
-    for key, items in trans_withdraw_df[items_col].items():
-        if isinstance(items, list):
-            adj[int(key)].extend((int(i[0]), int(i[2])) for i in items
-                                 if isinstance(i, (list, tuple)) and len(i) >= 3)
+def _q8_account_months(account_ids, trans_withdraw_map):
+    # Months reached from a seed account's withdraw edges. Pure per-account:
+    # start node, visited set, depth and truncation are all fixed, so each
+    # unique account is collected exactly once regardless of loan count.
+    results = []
+    for account_id in account_ids:
+        account_id = int(account_id)
+        months = set()
+        for item in get_neighbors(trans_withdraw_map, account_id):
+            if item.__class__ is list and len(item) >= 3:
+                # fast path: parsed factor rows are [dst, amount, ts] lists
+                dst = int(item[0])
+                ts = item[2]
+                if ts is not None:
+                    ts = int(ts)
+            else:
+                dst = neighbor_id(item)
+                ts = neighbor_time(item)
+            if ts is None or dst == account_id: continue
+            months.add(month_start_ms(ts))
+            collect_path_stats(
+                trans_withdraw_map, dst, ts, {account_id, dst}, 1,
+                months_out=months,
+            )
+        results.append((account_id, months))
+    return results
+
+
+def _q8_window_keys(lmap, trans_withdraw_map):
+    # (loan, month) key sequence in loan first-occurrence order, month
+    # first-occurrence within loan.
+    seed_accounts = sorted(set(lmap.acc_flat.tolist()))
+    account_months = dict(_parallel_scan(
+        _q8_account_months, seed_accounts, trans_withdraw_map))
 
     keys = []
-    for loan_id, month_accounts in loan_month_account_map.items():
-        for month_start, account_ids in month_accounts.items():
+    loan_ids, loan_ptr = lmap.loan_ids, lmap.loan_ptr
+    row_month, acc_ptr, acc_flat = lmap.row_month, lmap.acc_ptr, lmap.acc_flat
+    for li in range(loan_ids.shape[0]):
+        loan_id = int(loan_ids[li])
+        for ri in range(int(loan_ptr[li]), int(loan_ptr[li + 1])):
+            month_start = int(row_month[ri])
             months = set()
-            for account_id in account_ids:
-                account_id = int(account_id)
-                for item in get_neighbors(trans_withdraw_df, account_id):
-                    dst = neighbor_id(item); ts = neighbor_time(item)
-                    if ts is None or dst == account_id: continue
-                    months.add(month_start_ms(ts))
-                    collect_path_stats(
-                        trans_withdraw_df, dst, ts, {account_id, dst}, 1,
-                        months_out=months,
-                    )
-            win_min = int(month_start)
-            win_max = max(max(months), win_min) if months else win_min
-            keys.append((int(loan_id), win_min, win_max))
+            for a in acc_flat[int(acc_ptr[ri]):int(acc_ptr[ri + 1])]:
+                acc_months = account_months.get(int(a))
+                if acc_months:
+                    months |= acc_months
+            win_max = max(max(months), month_start) if months else month_start
+            keys.append((loan_id, month_start, win_max))
+    return keys
+
+
+def _q8_scan_costs(key_pairs, adj, lmap):
+    rows = []
+    for (loan_id, win_min, win_max), tp in key_pairs:
+        lo, hi = lmap.loan_rows(loan_id)
+        seeds = set()
+        if lo >= 0:
+            row_month, acc_ptr, acc_flat = lmap.row_month, lmap.acc_ptr, lmap.acc_flat
+            for ri in range(lo, hi):
+                m = int(row_month[ri])
+                if tp.start_ms <= m < tp.end_ms:
+                    seeds.update(acc_flat[int(acc_ptr[ri]):int(acc_ptr[ri + 1])].tolist())
+        cost = _bfs_window_cost(adj, seeds, tp.start_ms, tp.end_ms)
+        rows.append([(loan_id, win_min, win_max), cost])
+    return rows
+
+
+def _candidates_query8(loan_month_account_map, trans_withdraw_df):
+    # _bfs_window_cost never reads past the first per_node_scan edges of a
+    # node (scanned += min(len(edges), per_node_scan); edges[:per_node_scan]),
+    # so the per_node_limit-truncated adjacency is output-identical and
+    # slimmer on data with >1000-degree hubs.
+    adj = table_adjacency(trans_withdraw_df, pairs=True,
+                          per_node_limit=2 * TRUNCATION_LIMIT)
+
+    keys = _q8_window_keys(loan_month_account_map,
+                           graph_adjacency(trans_withdraw_df))
     if not keys:
         return [], []
 
     time_params = time_select.findTimeParamsForMonthRanges(
         [(win_min, win_max) for _, win_min, win_max in keys])
-    candidate_rows = []
-    for (loan_id, win_min, win_max), tp in zip(keys, time_params):
-        seeds = {int(a) for m, accs in loan_month_account_map[loan_id].items()
-                 if tp.start_ms <= int(m) < tp.end_ms for a in accs}
-        cost = _bfs_window_cost(adj, seeds, tp.start_ms, tp.end_ms)
-        candidate_rows.append([(loan_id, win_min, win_max), cost])
+    candidate_rows = _parallel_scan(
+        _q8_scan_costs, list(zip(keys, time_params)), adj,
+        loan_month_account_map)
 
     target = max(1, int(len(candidate_rows) * 0.01))
     filtered = [r for r in candidate_rows if r[1] >= 100]
@@ -740,17 +1504,12 @@ def _candidates_query8(loan_month_account_map, trans_withdraw_df):
     return ids, time_list
 
 
-def _candidates_query12(person_account_df, transfer_out_df):
-    company_ids = _load_company_account_ids()
-    if not company_ids:
-        return [], []
-    person_col, account_col = person_account_df.columns[0], person_account_df.columns[1]
-    factor_rows, time_counts = [], defaultdict(lambda: defaultdict(int))
-
-    for _, row in person_account_df.iterrows():
-        person_id = row[person_col]
+def _q12_scan_persons(person_entries, transfer_out_df, company_ids):
+    results = []
+    for person_id, account_ids in person_entries:
         company_hits, edge_count = set(), 0
-        for account_id in row[account_col]:
+        person_time_counts = defaultdict(int)
+        for account_id in account_ids:
             for item in get_neighbors(transfer_out_df, account_id):
                 dst = neighbor_id(item)
                 if dst not in company_ids: continue
@@ -758,9 +1517,29 @@ def _candidates_query12(person_account_df, transfer_out_df):
                 company_hits.add(dst)
                 ts = neighbor_time(item)
                 if ts is not None:
-                    time_counts[person_id][month_start_ms(ts)] += 1
+                    person_time_counts[month_start_ms(ts)] += 1
         if edge_count > 0:
-            factor_rows.append([person_id, edge_count, len(company_hits)])
+            results.append(([person_id, edge_count, len(company_hits)],
+                            dict(person_time_counts)))
+    return results
+
+
+def _candidates_query12(person_account_df, transfer_out_df):
+    company_ids = _load_company_account_ids()
+    if not company_ids:
+        return [], []
+    person_col, account_col = person_account_df.columns[0], person_account_df.columns[1]
+    person_entries = [(row[person_col], row[account_col])
+                      for _, row in person_account_df.iterrows()]
+    scan_results = _parallel_scan(
+        _q12_scan_persons, person_entries, graph_adjacency(transfer_out_df),
+        company_ids)
+
+    factor_rows = [factor_row for factor_row, _ in scan_results]
+    time_counts = defaultdict(lambda: defaultdict(int))
+    for factor_row, person_time_counts in scan_results:
+        for month, count in person_time_counts.items():
+            time_counts[factor_row[0]][month] += count
 
     if not factor_rows or not time_counts:
         return [], []
@@ -808,16 +1587,22 @@ def _run_iter_pipeline(query_id, portion=0.01):
     first_path, acct_path, amount_path, time_path, steps = _iter_query_setup(query_id)
 
     first_df   = load_person_account_df(first_path)
-    account_df = read_csv(acct_path)
     amount_df  = read_csv(amount_path)
     time_df    = read_csv(time_path)
 
+    if acct_path == first_path:
+        # q3/q11 iterate the same table as both first and account input;
+        # reuse the parsed copy instead of loading and eval-ing it twice
+        account_df = first_df.copy()
+    else:
+        account_df = read_csv(acct_path)
     acct_col1, acct_col2 = account_df.columns[0], account_df.columns[1]
+    if acct_path != first_path:
+        _apply_literal_eval(account_df, acct_col2)
     first_col,  list_col = first_df.columns[0],   first_df.columns[1]
     amt_col  = amount_df.columns[0]
     time_col = time_df.columns[0]
 
-    account_df[acct_col2] = account_df[acct_col2].apply(literal_eval)
     account_df.set_index(acct_col1, inplace=True)
     amount_df.set_index(amt_col, inplace=True)
     time_df.set_index(time_col, inplace=True)
@@ -849,7 +1634,7 @@ def _run_iter_pipeline(query_id, portion=0.01):
 
 def generate_query1():
     try:
-        transfer_out_df       = load_indexed_list_df(factor_path('account_transfer_out_items'))
+        transfer_out_df       = load_indexed_graph(factor_path('account_transfer_out_items'))
         blocked_signin_df     = read_csv(factor_path('blocked_signin_month'))
         blocked_signin_df.set_index(blocked_signin_df.columns[0], inplace=True)
         ids, time_list = _candidates_query1(transfer_out_df, blocked_signin_df)
@@ -863,7 +1648,7 @@ def generate_query1():
 def generate_query2():
     try:
         person_account_df  = load_person_account_df(factor_path('person_account_list'))
-        transfer_in_df     = load_indexed_list_df(factor_path('account_transfer_in_items'))
+        transfer_in_df     = load_indexed_graph(factor_path('account_transfer_in_items'))
         loan_deposit_df    = read_csv(factor_path('account_loan_deposit_month'))
         loan_deposit_df.set_index(loan_deposit_df.columns[0], inplace=True)
         ids, time_list = _candidates_query2(person_account_df, transfer_in_df, loan_deposit_df)
@@ -876,7 +1661,7 @@ def generate_query2():
 
 def generate_query3():
     ids, times, *_ = _run_iter_pipeline(3, portion=0.20)
-    transfer_out_df = load_indexed_list_df(factor_path('account_transfer_out_items'))
+    transfer_out_df = load_indexed_graph(factor_path('account_transfer_out_items'))
     friendly_accounts = set(_get_sr6_friendly_months())
     ids, id2_list, time_list = _candidates_query3(
         transfer_out_df, ids, times, friendly_accounts)
@@ -888,8 +1673,8 @@ def generate_query3():
 
 def generate_query4():
     try:
-        transfer_out_df  = load_indexed_list_df(factor_path('account_transfer_out_items'))
-        transfer_in_df   = load_indexed_list_df(factor_path('account_transfer_in_items'))
+        transfer_out_df  = load_indexed_graph(factor_path('account_transfer_out_items'))
+        transfer_in_df   = load_indexed_graph(factor_path('account_transfer_in_items'))
         ids, dst_ids, time_list = _candidates_query4(transfer_out_df, transfer_in_df)
     except (FileNotFoundError, ValueError, KeyError, IndexError):
         ids, time_list, *_ = _run_iter_pipeline(3)
@@ -901,7 +1686,7 @@ def generate_query4():
 
 def generate_query5_and_12():
     person_account_df = load_person_account_df(factor_path('person_account_list'))
-    transfer_out_df   = load_indexed_list_df(factor_path('account_transfer_out_items'))
+    transfer_out_df   = load_indexed_graph(factor_path('account_transfer_out_items'))
 
     ids5, time_list5 = _candidates_query5(person_account_df, transfer_out_df)
     write_params(output_path('complex_5_param.csv'), ids5, time_list5,
@@ -913,7 +1698,7 @@ def generate_query5_and_12():
 
 
 def generate_query6():
-    withdraw_in_df       = load_indexed_list_df(factor_path('account_withdraw_in_items'))
+    withdraw_in_df       = load_indexed_graph(factor_path('account_withdraw_in_items'))
     transfer_in_month_df = read_csv(factor_path('transfer_in_month'))
     transfer_in_month_df.set_index(transfer_in_month_df.columns[0], inplace=True)
     ids, time_list = _candidates_query6(withdraw_in_df, transfer_in_month_df)
@@ -929,15 +1714,18 @@ def generate_query7_and_9():
 
 
 def generate_query8():
-    loan_map        = load_loan_month_account_map(factor_path('loan_deposit_account_month_list'))
-    trans_withdraw  = load_indexed_list_df(factor_path('trans_withdraw_items'))
+    loan_map = load_loan_month_accounts_array(factor_path('loan_deposit_account_month_list'))
+    trans_withdraw  = load_indexed_graph(factor_path('trans_withdraw_items'))
     ids, time_list  = _candidates_query8(loan_map, trans_withdraw)
     write_params(output_path('complex_8_param.csv'), ids, time_list)
 
 
 def generate_query10():
     ids, time_list = _run_1hop_pipeline('person_invest_company', 'invest_month')
-    id2_list = [_random_pair(ids, i) for i in range(len(ids))]
+    # forkserver children reseed the global random from OS entropy at fork,
+    # so draw pairs from a locally seeded generator for reproducible output.
+    rng = random.Random(42)
+    id2_list = [_random_pair(ids, i, rng) for i in range(len(ids))]
     write_params(output_path('complex_10_param.csv'), ids, time_list,
                  threshold=False, truncate_limit=False, truncate_order=False,
                  id2_list=id2_list, id_col="pid1", id2_col="pid2")
@@ -966,9 +1754,9 @@ def _run_1hop_pipeline(count_table, month_table, sr6_filter=False):
     return ids, time_list
 
 
-def _random_pair(id_list, i):
+def _random_pair(id_list, i, rng):
     while True:
-        j = random.randint(0, len(id_list) - 1)
+        j = rng.randint(0, len(id_list) - 1)
         if id_list[j] != id_list[i]:
             return id_list[j]
 
@@ -1014,10 +1802,47 @@ def _load_card_account_ids():
 _SR6_FRIENDLY_MONTHS = None
 
 
+def _sr6_scan_blocked_mids(mid_ids, transfer_out_df, blocked_ids):
+    pairs = []
+    for mid in mid_ids:
+        mid_int = int(mid)
+        months = set()
+        for item in get_neighbors(transfer_out_df, mid_int):
+            dst = neighbor_id(item)
+            ts  = neighbor_time(item)
+            if ts is None or dst == mid_int or dst not in blocked_ids:
+                continue
+            months.add(month_start_ms(ts))
+        if months:
+            pairs.append((mid_int, months))
+    return pairs
+
+
+def _sr6_scan_friendly(src_ids, transfer_in_df, mid_blocked_months):
+    pairs = []
+    for src in src_ids:
+        src_int = int(src)
+        months = set()
+        for item in get_neighbors(transfer_in_df, src):
+            mid = neighbor_id(item)
+            ts  = neighbor_time(item)
+            if ts is None or mid == src_int:
+                continue
+            mid_months = mid_blocked_months.get(mid)
+            if not mid_months:
+                continue
+            m = month_start_ms(ts)
+            if m in mid_months:
+                months.add(m)
+        if months:
+            pairs.append((src_int, months))
+    return pairs
+
+
 def _load_sr6_friendly_account_months():
     try:
-        transfer_in_df  = load_indexed_list_df(factor_path('account_transfer_in_items'))
-        transfer_out_df = load_indexed_list_df(factor_path('account_transfer_out_items'))
+        transfer_in_df  = load_indexed_graph(factor_path('account_transfer_in_items'))
+        transfer_out_df = load_indexed_graph(factor_path('account_transfer_out_items'))
         blocked_df      = read_csv(factor_path('blocked_signin_month'))
     except (FileNotFoundError, ValueError, KeyError):
         return {}
@@ -1026,33 +1851,16 @@ def _load_sr6_friendly_account_months():
     if not blocked_ids:
         return {}
 
-    mid_blocked_months = defaultdict(set)
-    for mid in transfer_out_df.index.unique():
-        mid_int = int(mid)
-        for item in get_neighbors(transfer_out_df, mid):
-            dst = neighbor_id(item)
-            ts  = neighbor_time(item)
-            if ts is None or dst == mid_int or dst not in blocked_ids:
-                continue
-            mid_blocked_months[mid_int].add(month_start_ms(ts))
+    mid_blocked_months = dict(_parallel_scan(
+        _sr6_scan_blocked_mids, list(transfer_out_df.index.unique()),
+        graph_adjacency(transfer_out_df), blocked_ids))
     if not mid_blocked_months:
         return {}
 
-    friendly = defaultdict(set)
-    for src in transfer_in_df.index.unique():
-        src_int = int(src)
-        for item in get_neighbors(transfer_in_df, src):
-            mid = neighbor_id(item)
-            ts  = neighbor_time(item)
-            if ts is None or mid == src_int:
-                continue
-            months = mid_blocked_months.get(mid)
-            if not months:
-                continue
-            m = month_start_ms(ts)
-            if m in months:
-                friendly[src_int].add(m)
-    return dict(friendly)
+    friendly = dict(_parallel_scan(
+        _sr6_scan_friendly, list(transfer_in_df.index.unique()),
+        graph_adjacency(transfer_in_df), mid_blocked_months))
+    return friendly
 
 
 def _get_sr6_friendly_months():
@@ -1095,17 +1903,24 @@ def _mask_time_bucket_to_sr6_months(time_bucket_df):
     if not month_cols:
         return time_bucket_df
     df = time_bucket_df.copy()
-    for idx in df.index:
+    cols = [c for c in df.columns if c in month_cols]
+    arr = df[cols].to_numpy(copy=True)
+
+    # rows share few distinct friendly-month sets; zero each group in one
+    # vectorized pass (same cells the per-cell df.at loop would clear)
+    rows_by_months = defaultdict(list)
+    for row_i, idx in enumerate(df.index):
         try:
             acc_int = int(idx)
         except (TypeError, ValueError):
             continue
         acc_friendly = friendly.get(acc_int)
-        if not acc_friendly:
-            continue
-        for col, ms in month_cols.items():
-            if ms not in acc_friendly:
-                df.at[idx, col] = 0
+        if acc_friendly:
+            rows_by_months[frozenset(acc_friendly)].append(row_i)
+    for acc_months, rows in rows_by_months.items():
+        zero = np.array([month_cols[c] not in acc_months for c in cols])
+        arr[np.ix_(rows, zero)] = 0
+    df[cols] = arr
     return df
 
 
@@ -1215,12 +2030,18 @@ def _process_get_neighbors(chunk, account_df, account_amount_df, amount_bucket_d
 
 def _get_next_neighbor_list(neighbors_df, account_df, account_amount_df, amount_bucket_df, query_id):
     num_list = [] if query_id in (3, 11) else list(amount_bucket_df.columns)
-    parallelism = max(1, multiprocessing.cpu_count() // 4)
-    chunks = np.array_split(neighbors_df, parallelism)
-    with concurrent.futures.ProcessPoolExecutor(max_workers=parallelism) as ex:
-        futures = [ex.submit(_process_get_neighbors, c, account_df, account_amount_df,
-                             amount_bucket_df, num_list, query_id) for c in chunks]
-        results = [f.result() for f in concurrent.futures.as_completed(futures)]
+    parallelism = INNER_WORKERS
+    # np.array_split(DataFrame) yields ndarrays on numpy>=2; slice explicitly
+    # to keep DataFrame chunks (rows are recombined via sort_index anyway).
+    # fork-COW shares the parsed account_df across workers instead of
+    # pickling a copy to each; the trailing sort_index keeps the result
+    # deterministic.
+    step = -(-len(neighbors_df) // parallelism)
+    chunks = [neighbors_df.iloc[i:i + step]
+              for i in range(0, len(neighbors_df), step)]
+    results = _fork_map(_process_get_neighbors, chunks,
+                        (account_df, account_amount_df,
+                         amount_bucket_df, num_list, query_id))
     return pd.concat(results).sort_index()
 
 
@@ -1231,14 +2052,25 @@ def _process_batch(batch, basic_sum_df, first_col, second_col):
     return merged.groupby(first_col).sum()
 
 
+def _process_sum_groups(batch_group, basic_sum_df, first_col, second_col):
+    return pd.concat([_process_batch(b, basic_sum_df, first_col, second_col)
+                      for b in batch_group])
+
+
 def _get_next_sum_table(neighbors_df, basic_sum_df):
     first_col  = neighbors_df.columns[0]
     second_col = neighbors_df.columns[1]
     batches    = [neighbors_df.iloc[i:i+BATCH_SIZE] for i in range(0, len(neighbors_df), BATCH_SIZE)]
-    parallelism = max(1, multiprocessing.cpu_count() // 4)
-    with concurrent.futures.ProcessPoolExecutor(max_workers=parallelism) as ex:
-        results = list(ex.map(partial(_process_batch, basic_sum_df=basic_sum_df,
-                                      first_col=first_col, second_col=second_col), batches))
+    parallelism = INNER_WORKERS
+    # fork-COW shares basic_sum_df (see _fork_map). The 5000-row batches
+    # (tens of thousands at SF1000+) are grouped into `parallelism`
+    # super-chunks — one fork each; concat is associative and the final
+    # groupby().sum() is int-exact regardless of batch grouping.
+    group = -(-len(batches) // parallelism)
+    results = _fork_map(
+        _process_sum_groups,
+        [batches[i:i + group] for i in range(0, len(batches), group)],
+        (basic_sum_df, first_col, second_col))
     return pd.concat(results).groupby(first_col).sum().astype(int)
 
 
@@ -1246,34 +2078,51 @@ def _get_next_sum_table(neighbors_df, basic_sum_df):
 # Entry point
 # ---------------------------------------------------------------------------
 
-# Map each logical task to its generator function.
-# Tasks in the same inner list run in the same process batch.
-QUERY_TASKS = [
-    generate_query6,
-    generate_query2,
-    generate_query3,
-    generate_query4,
-    generate_query5_and_12,
-    generate_query7_and_9,
-    generate_query11,
+# Task order, memory-lean: the run peak is the SUM of the co-resident
+# tasks, so the longest task (q8, 151s at SF30) leads and gets only
+# light/medium slot-mates during its tail, and the heavy tail (q6, q3, q1)
+# is spread so q6+q3 never co-run at <=2 slots. SF30 CSR solo peaks (post
+# array-compression): q6 5.3, q8 3.5, q3 4.6, q1 4.2, q7&9 3.6, q2 3.0,
+# q5&12 2.6, q4 2.5 GiB. Output is order-invariant (each task writes its
+# own file).
+TASK_ORDER = [
     generate_query8,
     generate_query10,
+    generate_query11,
+    generate_query5_and_12,
+    generate_query2,
+    generate_query4,
+    generate_query6,
+    generate_query3,
     generate_query1,
+    generate_query7_and_9,
 ]
 
 
 def main():
     multiprocessing.set_start_method('forkserver')
-    batch_size = 5
-    for i in range(0, len(QUERY_TASKS), batch_size):
-        procs = []
-        for task in QUERY_TASKS[i:i+batch_size]:
+    # dynamic task slots: a new task starts as soon as one finishes, so the
+    # longest task overlaps with the whole tail instead of gating a batch.
+    # Plain non-daemon Processes (not a pool) so tasks may spawn their own
+    # inner process pools.
+    max_tasks = MAX_CONCURRENT_TASKS
+    pending = list(TASK_ORDER)
+    running = []  # (Process, task name)
+    while pending or running:
+        while pending and len(running) < max_tasks:
+            task = pending.pop(0)
             p = multiprocessing.Process(target=task)
             p.start()
-            procs.append((p, task.__name__))
-        for p, name in procs:
-            p.join()
-            print(f"{name} finished")
+            running.append((p, task.__name__))
+        ready = multiprocessing.connection.wait([p.sentinel for p, _ in running])
+        still = []
+        for p, name in running:
+            if p.sentinel in ready:
+                p.join()
+                print(f"{name} finished")
+            else:
+                still.append((p, name))
+        running = still
 
 
 if __name__ == "__main__":
