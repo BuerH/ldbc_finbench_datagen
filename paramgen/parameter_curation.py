@@ -472,6 +472,144 @@ def load_loan_accounts(file_path):
     return LoanAccountMap(loan_ids, loan_ptr, fm, acc_ptr, acc_flat)
 
 
+def _read_table_header(file_path):
+    path = (file_path if os.path.isfile(file_path)
+            else sorted(glob(os.path.join(file_path, '*.csv')))[0])
+    with open(path, 'rb') as f:
+        return f.readline().decode('utf-8').strip().split('|')
+
+
+def _ragged_gather(values, starts, lens):
+    """values[starts[i]:starts[i]+lens[i]] concatenated, in row order."""
+    total = int(lens.sum())
+    if total == 0:
+        return values[:0]
+    dest = np.append(0, np.cumsum(lens))[:-1]
+    idx = np.arange(total, dtype=np.int64) + np.repeat(starts - dest, lens)
+    return values[idx]
+
+
+def _parse_id_list_part(text):
+    """Rows `id|[a,b,...]` → (ids, per-row counts, flat dst)."""
+    ids = array('q')
+    counts = array('q')
+    flat = array('q')
+    for line in text.split('\n'):
+        if not line:
+            continue
+        pipe = line.find('|')
+        if pipe < 0 or line[pipe + 1] != '[':
+            raise RuntimeError(f'unexpected list row: {line[:80]!r}')
+        inner = line[pipe + 2:-1]
+        toks = inner.split(',') if inner else []
+        ids.append(int(line[:pipe]))
+        counts.append(len(toks))
+        for t in toks:
+            flat.append(int(t))
+    return ids, counts, flat
+
+
+def _load_id_list_arrays(file_path):
+    """Sorted-by-id CSR: (ids, ptr, flat_dst)."""
+    parts = _load_parts(file_path, _parse_id_list_part)
+    ids_a, cnt_a, dst_a = array('q'), array('q'), array('q')
+    for i, c, d in parts:
+        ids_a.extend(i)
+        cnt_a.extend(c)
+        dst_a.extend(d)
+    del parts
+    ids = np.frombuffer(ids_a, dtype=np.int64)
+    counts = np.frombuffer(cnt_a, dtype=np.int64)
+    dst = np.frombuffer(dst_a, dtype=np.int64)
+    order = np.argsort(ids, kind='stable')
+    lens = counts[order]
+    ptr = np.append(0, np.cumsum(lens))
+    starts = np.append(0, np.cumsum(counts))[:-1][order]
+    return ids[order], ptr, _ragged_gather(dst, starts, lens)
+
+
+def _parse_int_pair_part(text):
+    """Rows `id|value` → (ids, values)."""
+    ids = array('q')
+    vals = array('q')
+    for line in text.split('\n'):
+        if not line:
+            continue
+        pipe = line.find('|')
+        if pipe < 0:
+            raise RuntimeError(f'unexpected pair row: {line[:80]!r}')
+        ids.append(int(line[:pipe]))
+        vals.append(int(line[pipe + 1:]))
+    return ids, vals
+
+
+def _load_int_pairs_sorted(file_path):
+    parts = _load_parts(file_path, _parse_int_pair_part)
+    ids_a, val_a = array('q'), array('q')
+    for i, v in parts:
+        ids_a.extend(i)
+        val_a.extend(v)
+    del parts
+    ids = np.frombuffer(ids_a, dtype=np.int64)
+    vals = np.frombuffer(val_a, dtype=np.int64)
+    order = np.argsort(ids, kind='stable')
+    return ids[order], vals[order]
+
+
+def _parse_month_sparse_part(text):
+    """Rows `id|m1|m2|...` → (ids, per-row nnz, col_idx, val); zero cells skipped."""
+    ids = array('q')
+    counts = array('q')
+    cols = array('q')
+    vals = array('q')
+    for line in text.split('\n'):
+        if not line:
+            continue
+        parts = line.split('|')
+        ids.append(int(parts[0]))
+        nnz = 0
+        for ci in range(1, len(parts)):
+            tok = parts[ci]
+            if tok != '0':
+                cols.append(ci - 1)
+                vals.append(int(tok))
+                nnz += 1
+        counts.append(nnz)
+    return ids, counts, cols, vals
+
+
+def _load_month_sparse(file_path):
+    """Sorted-id CSR of (col_idx, val) + per-column (year, month) and ts metadata."""
+    header = _read_table_header(file_path)
+    col_months = []
+    col_ts = []
+    for name in header[1:]:
+        col_months.append(time_select._parse_month_column(str(name)))
+        try:
+            ts = int(str(name))
+        except ValueError:
+            ts = None
+        col_ts.append(ts if ts is not None and ts > 10 ** 11 else None)
+    parts = _load_parts(file_path, _parse_month_sparse_part)
+    ids_a, cnt_a, col_a, val_a = array('q'), array('q'), array('q'), array('q')
+    for i, c, cl, v in parts:
+        ids_a.extend(i)
+        cnt_a.extend(c)
+        col_a.extend(cl)
+        val_a.extend(v)
+    del parts
+    ids = np.frombuffer(ids_a, dtype=np.int64)
+    nnz = np.frombuffer(cnt_a, dtype=np.int64)
+    cols = np.frombuffer(col_a, dtype=np.int64)
+    vals = np.frombuffer(val_a, dtype=np.int64)
+    order = np.argsort(ids, kind='stable')
+    lens = nnz[order]
+    ptr = np.append(0, np.cumsum(lens))
+    starts = np.append(0, np.cumsum(nnz))[:-1][order]
+    perm = np.arange(cols.shape[0], dtype=np.int64) + np.repeat(starts - ptr[:-1], lens)
+    return ids[order], ptr, cols[perm], vals[perm], col_months, col_ts
+
+
 def to_month_counts_map(month_df):
     col_months = {}
     for c in month_df.columns:
@@ -1382,6 +1520,100 @@ def _run_iter_pipeline(query_id, portion=0.01):
     return ids, time_list
 
 
+def _q3_iter_params(portion=0.20):
+    """Array-based query-3 iter pipeline (bit-identical to _run_iter_pipeline(3))."""
+    ids_sorted, list_ptr, list_dst = _load_id_list_arrays(
+        factor_path('account_in_out_list'))
+    cnt_ids, cnt_vals = _load_int_pairs_sorted(factor_path('account_in_out_count'))
+
+    n = ids_sorted.shape[0]
+
+    # next_amount: for each account, sum of count-table values over its
+    # in_out_list neighbors (missing neighbors count 0)
+    sums = np.zeros(n, dtype=np.int64)
+    edge_row = np.repeat(np.arange(n, dtype=np.int64), np.diff(list_ptr))
+    step = 50_000_000
+    for lo in range(0, edge_row.shape[0], step):
+        dst = list_dst[lo:lo + step]
+        if cnt_ids.shape[0]:
+            pos = np.searchsorted(cnt_ids, dst)
+            pos_c = np.minimum(pos, cnt_ids.shape[0] - 1)
+            hit = (pos < cnt_ids.shape[0]) & (cnt_ids[pos_c] == dst)
+            val = np.where(hit, cnt_vals[pos_c], 0)
+        else:
+            val = np.zeros(dst.shape[0], dtype=np.int64)
+        part = np.bincount(edge_row[lo:lo + step],
+                           weights=val.astype(np.float64), minlength=n)
+        sums += part.astype(np.int64)
+    del edge_row
+    first_array = np.column_stack((ids_sorted, sums))
+    del sums
+
+    friendly = _get_sr6_friendly_months()
+    if friendly:
+        fkeys = np.fromiter(friendly.keys(), dtype=np.int64, count=len(friendly))
+        fkeys.sort()
+        pos = np.searchsorted(fkeys, ids_sorted)
+        pos_c = np.minimum(pos, fkeys.shape[0] - 1)
+        kept = (pos < fkeys.shape[0]) & (fkeys[pos_c] == ids_sorted)
+        if kept.any():
+            first_array = first_array[kept]
+    ids = select_candidates(first_array, portion)
+
+    # month buckets only for the selected accounts: gather each selected
+    # account's neighbor slices, then the neighbors' month CSR rows
+    sel_ids = np.array(ids, dtype=np.int64)
+    k = sel_ids.shape[0]
+    m_ids, m_ptr, m_cols, m_vals, col_months, col_ts = _load_month_sparse(
+        factor_path('account_in_out_month'))
+    num_months = len(col_months)
+    dense = np.zeros((k, num_months), dtype=np.int64)
+    if k and num_months and m_ids.shape[0]:
+        sel_rows = np.searchsorted(ids_sorted, sel_ids)
+        lo = list_ptr[sel_rows]
+        lens = list_ptr[sel_rows + 1] - lo
+        nbr = _ragged_gather(list_dst, lo, lens)
+        owner_edge = np.repeat(np.arange(k, dtype=np.int64), lens)
+        mpos = np.searchsorted(m_ids, nbr)
+        mpos_c = np.minimum(mpos, m_ids.shape[0] - 1)
+        mhit = (mpos < m_ids.shape[0]) & (m_ids[mpos_c] == nbr)
+        g_lo = m_ptr[mpos_c]
+        g_hi = np.where(mhit, m_ptr[mpos_c + 1], g_lo)
+        g_lens = g_hi - g_lo
+        g_col = _ragged_gather(m_cols, g_lo, g_lens)
+        g_val = _ragged_gather(m_vals, g_lo, g_lens)
+        g_owner = np.repeat(owner_edge, g_lens)
+        dense = np.bincount(
+            g_owner * num_months + g_col, weights=g_val.astype(np.float64),
+            minlength=k * num_months).reshape(k, num_months).astype(np.int64)
+
+    # Only selected accounts need masking; leave non-timestamp columns intact.
+    rows_by_months = defaultdict(list)
+    for row, account_id in enumerate(sel_ids):
+        months = friendly.get(int(account_id))
+        if months:
+            rows_by_months[frozenset(months)].append(row)
+    for months, rows in rows_by_months.items():
+        zero = np.array([ts is not None and ts not in months for ts in col_ts],
+                        dtype=bool)
+        dense[np.ix_(rows, zero)] = 0
+    nz_r, nz_c = np.nonzero(dense)
+
+    vals_flat = dense[nz_r, nz_c]
+    boundaries = np.searchsorted(nz_r, np.arange(k + 1))
+    factors = []
+    for o in range(k):
+        row_factors = []
+        for j in range(boundaries[o], boundaries[o + 1]):
+            pm = col_months[nz_c[j]]
+            if pm is not None:
+                row_factors.append(time_select.MonthYearCount(
+                    pm[1], pm[0], int(vals_flat[j])))
+        factors.append(row_factors)
+    time_list = time_select.findTimeParameters(factors)
+    return ids, time_list
+
+
 # ---------------------------------------------------------------------------
 # Per-query generate functions  (each one: load → build candidates → write)
 # ---------------------------------------------------------------------------
@@ -1414,9 +1646,9 @@ def generate_query2():
 
 
 def generate_query3():
-    ids, times = _run_iter_pipeline(3, portion=0.20)
     transfer_out_df = load_graph(factor_path('account_transfer_out_items'))
-    friendly_accounts = set(_get_sr6_friendly_months())
+    friendly_accounts = set(_get_sr6_friendly_months(transfer_out_df))
+    ids, times = _q3_iter_params(portion=0.20)
     ids, id2_list, time_list = _candidates_query3(
         transfer_out_df, ids, times, friendly_accounts)
     if ids:
@@ -1591,11 +1823,12 @@ def _sr6_scan_friendly(src_ids, transfer_in_df, mid_blocked_months):
     return pairs
 
 
-def _load_sr6_friendly_account_months():
+def _load_sr6_friendly_account_months(transfer_out_df=None):
     try:
-        transfer_in_df  = load_graph(factor_path('account_transfer_in_items'))
-        transfer_out_df = load_graph(factor_path('account_transfer_out_items'))
-        blocked_df      = read_csv(factor_path('blocked_signin_month'))
+        transfer_in_df = load_graph(factor_path('account_transfer_in_items'))
+        if transfer_out_df is None:
+            transfer_out_df = load_graph(factor_path('account_transfer_out_items'))
+        blocked_df = read_csv(factor_path('blocked_signin_month'))
     except (FileNotFoundError, ValueError, KeyError):
         return {}
 
@@ -1615,10 +1848,10 @@ def _load_sr6_friendly_account_months():
     return friendly
 
 
-def _get_sr6_friendly_months():
+def _get_sr6_friendly_months(transfer_out_df=None):
     global _SR6_FRIENDLY_MONTHS
     if _SR6_FRIENDLY_MONTHS is None:
-        _SR6_FRIENDLY_MONTHS = _load_sr6_friendly_account_months()
+        _SR6_FRIENDLY_MONTHS = _load_sr6_friendly_account_months(transfer_out_df)
     return _SR6_FRIENDLY_MONTHS
 
 
